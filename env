@@ -1,0 +1,11 @@
+# Telegram — fill in after creating a bot with @BotFather, then:
+# systemctl restart alert-bridge
+TG_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
+TG_CHAT=YOUR_CHAT_ID
+MT_HOST=192.168.12.200
+MT_USER=suricata
+MT_PASS=YOUR_MIKROTIK_PASSWORD
+# Our own public IPs — added to the whitelist and HOME_NETS so the bridge
+# never blocks itself and can tell which side of a flow is the attacker.
+WAN_IP=203.0.113.1/32
+WAN_IPV6_PREFIX=2001:db8:aaaa:1::/64
