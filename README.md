@@ -366,7 +366,10 @@ sudo chmod 600 /opt/alert-bridge/env
 sudo systemctl daemon-reload
 ```
 
-All configuration lives in `/opt/alert-bridge/env`.
+All configuration lives in `/opt/alert-bridge/env`. The template contains
+**no real addresses** — every value is a placeholder (or empty) that you fill
+in during the steps below, so the bridge does nothing until it's configured
+for *your* network.
 
 ### 8a. Telegram bot
 
@@ -376,7 +379,7 @@ All configuration lives in `/opt/alert-bridge/env`.
 3. Get the chat ID and put it into `TG_CHAT=`:
 
 ```bash
-curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | jq '.result[0].message.chat.id'
+curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | jq '.result[-1].message.chat.id'
 ```
 
 (Leave both empty if you want blocking without notifications.)
@@ -419,8 +422,10 @@ Enable the REST API (rides on `www-ssl`), restricted to the Suricata box:
 > over HTTPS from other machines, include your LAN subnet in that address
 > list **before** pressing Enter.
 
-Put the router IP, user, and password into `/opt/alert-bridge/env`
-(`MT_HOST=`, `MT_USER=`, `MT_PASS=`).
+Put the router's LAN IP, user, and password into `/opt/alert-bridge/env` —
+replace the `MT_HOST=YOUR_ROUTER_LAN_IP` placeholder with your router's
+address (`192.168.12.200` in the examples above) and fill in `MT_USER=` and
+`MT_PASS=`.
 
 ### 8c. Firewall drop rules
 
@@ -438,12 +443,15 @@ can never block your own LAN:
 ### 8d. Start the bridge
 
 Finish `/opt/alert-bridge/env` with your own public addresses so the bridge
-can never block *you*:
+can never block *you*. These ship **empty** in the template — set them to
+your own values in CIDR notation (from the Prerequisites table), e.g.:
 
 ```
 WAN_IP=203.0.113.1/32
 WAN_IPV6_PREFIX=2001:db8:aaaa:1::/64
 ```
+
+Leave `WAN_IPV6_PREFIX=` empty if you have no IPv6.
 
 ```bash
 sudo systemctl enable --now alert-bridge
