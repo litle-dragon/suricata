@@ -391,18 +391,10 @@ encrypted:
 
 ```routeros
 /certificate add name=rest-api common-name=192.168.12.200 days-valid=3650 \
-    key-usage=digital-signature,key-encipherment,tls-server
+    key-usage=digital-signature,key-encipherment,tls-server,key-cert-sign,crl-sign
 /certificate sign rest-api
+/certificate set rest-api trusted=yes
 ```
-
-> Some RouterOS 7 versions refuse to self-sign a server certificate directly.
-> If `sign` fails, create a local CA first and sign with it:
->
-> ```routeros
-> /certificate add name=local-ca common-name=local-ca key-usage=key-cert-sign,crl-sign days-valid=3650
-> /certificate sign local-ca
-> /certificate sign rest-api ca=local-ca
-> ```
 
 Create a dedicated API user, locked to the Suricata box's IP, with the
 minimum permissions (generate your own strong password):
