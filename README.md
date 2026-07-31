@@ -178,7 +178,11 @@ sudo vi /etc/suricata/suricata.yaml
 It's a huge file; only a handful of changes are needed.
 
 **1. `HOME_NET`** — add your **public** IPv4 (and IPv6 prefix, if you have
-one) alongside your LAN networks. Find them with:
+one) alongside your LAN networks. If you have **2 ISPs (Dual WAN)**, you **must include both public WAN IPs** in `HOME_NET`.
+
+> **Why both IPs are needed in `HOME_NET`:** Most Suricata rules look for attacks coming from `$EXTERNAL_NET` to `$HOME_NET`. If your second WAN IP isn't in `HOME_NET`, attacks coming in through WAN2 won't match inbound attack rules.
+
+Find your public IP(s):
 
 ```bash
 curl -4 ifconfig.me && echo
@@ -186,8 +190,14 @@ curl -6 ifconfig.me && echo
 ```
 
 ```yaml
+# Single WAN example:
 HOME_NET: "[192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,203.0.113.1/32,2001:db8:aaaa:1::/64]"
+
+# Dual/Multi-WAN example (include both public WAN IPs):
+HOME_NET: "[192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,203.0.113.1/32,198.51.100.2/32]"
 ```
+
+> **Note on capture interface for Dual WAN:** You do **NOT** need multiple interfaces in Suricata. MikroTik streams TZSP traffic from both WANs over LAN to UDP 37008, where `tzsp2pcap` decapsulates both streams onto the single dummy interface `tzsp0`. Suricata listens on `tzsp0` and inspects traffic for both WANs simultaneously.
 
 **2. Capture interface** — in the `af-packet:` section, point Suricata at the
 dummy interface:
@@ -269,15 +279,21 @@ sudo chmod +x /etc/cron.weekly/suricata-rules
 On the router (substitute your Suricata box IP and your WAN interface name):
 
 ```routeros
+# For Single WAN (e.g. WAN2):
 /tool sniffer set streaming-enabled=yes streaming-server=192.168.12.232:37008 \
     filter-stream=yes filter-interface=WAN2
+/tool sniffer start
+
+# For Dual WAN (e.g. WAN1, WAN2):
+/tool sniffer set streaming-enabled=yes streaming-server=192.168.12.232:37008 \
+    filter-stream=yes filter-interface=WAN1,WAN2
 /tool sniffer start
 ```
 
 - `streaming-enabled=yes` — stream packets over the network instead of
   writing them to a file.
 - `streaming-server` — your Suricata box, UDP port 37008.
-- `filter-interface=WAN2` — mirror **only the WAN**. Never mirror the LAN
+- `filter-interface` — mirror **only WAN interfaces** (`WAN2` or `WAN1,WAN2`). Never mirror the LAN
   interface the TZSP stream leaves through (packet loop).
 - `filter-stream=yes` — tells the sniffer never to capture its own TZSP
   stream. Sniffing only the WAN is the seatbelt; this is the airbag.
@@ -289,10 +305,16 @@ Verify:
 ```
 
 The sniffer does **not** survive a reboot, so add a scheduler that waits for
-the WAN interface to come up and then (re)starts it:
+the WAN interface(s) to come up and then (re)starts it.
 
+**Single WAN Scheduler:**
 ```routeros
 /system scheduler add name=start-sniffer on-event=":local up 0; :local i 0; :while (\$i < 180) do={ :do { :if ([/interface get [find name=\"WAN2\"] running]) do={ :set up 1 } } on-error={}; :if (\$up = 1) do={ :set i 181 } else={ :delay 1s; :set i (\$i + 1) } }; :if (\$up = 1) do={ /tool sniffer stop; :delay 1s; /tool sniffer start }" policy=ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon start-time=startup
+```
+
+**Dual WAN Scheduler** (starts for both if both are ready, or only for the active WAN if only one is ready):
+```routeros
+/system scheduler add name=start-sniffer on-event=":local i 0; :local w1 false; :local w2 false; :while (\$i < 180 and (\$w1 = false and \$w2 = false)) do={ :do { :set w1 [/interface get [find name=\"WAN1\"] running] } on-error={}; :do { :set w2 [/interface get [find name=\"WAN2\"] running] } on-error={}; :if (\$w1 = false and \$w2 = false) do={ :delay 1s; :set i (\$i + 1) } }; :delay 3s; :do { :set w1 [/interface get [find name=\"WAN1\"] running] } on-error={}; :do { :set w2 [/interface get [find name=\"WAN2\"] running] } on-error={}; :local ifaces \"\"; :if (\$w1 and \$w2) do={ :set ifaces \"WAN1,WAN2\" } else={ :if (\$w1) do={ :set ifaces \"WAN1\" }; :if (\$w2) do={ :set ifaces \"WAN2\" } }; :if (\$ifaces != \"\") do={ /tool sniffer stop; :delay 1s; /tool sniffer set filter-interface=\$ifaces; /tool sniffer start }" policy=ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon start-time=startup
 ```
 
 Back on the Linux box, packets should now be flowing:
@@ -426,9 +448,20 @@ are dropped with minimal CPU. Both are scoped to the WAN interface, so they
 can never block your own LAN:
 
 ```routeros
+# For Single WAN (e.g. WAN2):
 /ip firewall raw add chain=prerouting in-interface=WAN2 \
     src-address-list=suricata-block action=drop comment="Suricata auto-block"
 /ipv6 firewall raw add chain=prerouting in-interface=WAN2 \
+    src-address-list=suricata-block action=drop comment="Suricata auto-block (v6)"
+
+# For Dual WAN (create an Interface List containing both WANs):
+/interface list add name=WAN-LIST
+/interface list member add interface=WAN1 list=WAN-LIST
+/interface list member add interface=WAN2 list=WAN-LIST
+
+/ip firewall raw add chain=prerouting in-interface-list=WAN-LIST \
+    src-address-list=suricata-block action=drop comment="Suricata auto-block"
+/ipv6 firewall raw add chain=prerouting in-interface-list=WAN-LIST \
     src-address-list=suricata-block action=drop comment="Suricata auto-block (v6)"
 ```
 

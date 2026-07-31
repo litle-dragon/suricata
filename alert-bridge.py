@@ -44,8 +44,25 @@ TG_CHAT = os.environ.get("TG_CHAT", "")
 MT_HOST = os.environ.get("MT_HOST", "")
 MT_USER = os.environ.get("MT_USER", "")
 MT_PASS = os.environ["MT_PASS"]
-WAN_IP = os.environ.get("WAN_IP", "")            # own WAN public IP (CIDR)
-WAN_IPV6_PREFIX = os.environ.get("WAN_IPV6_PREFIX", "")  # own IPv6 prefix
+WAN_IP = os.environ.get("WAN_IP", "")            # own WAN public IP(s) (CIDR, comma-separated for multi-WAN)
+WAN_IPV6_PREFIX = os.environ.get("WAN_IPV6_PREFIX", "")  # own IPv6 prefix(es)
+
+
+def _parse_cidrs(val: str) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    res = []
+    if not val:
+        return res
+    for item in val.replace(",", " ").split():
+        item = item.strip()
+        if item:
+            try:
+                res.append(ipaddress.ip_network(item, strict=False))
+            except ValueError as e:
+                print(f"warning: invalid CIDR '{item}': {e}", flush=True)
+    return res
+
+
+_wan_nets = _parse_cidrs(WAN_IP) + _parse_cidrs(WAN_IPV6_PREFIX)
 
 # Never block these, no matter what Suricata says: RFC1918 / CGNAT / loopback
 # and well-known public DNS resolvers. Own public IPs come from WAN_IP /
@@ -57,12 +74,10 @@ WHITELIST = [
         "127.0.0.0/8", "100.64.0.0/10",
         "1.1.1.1/32", "8.8.8.8/32", "9.9.9.9/32",
     )
-] + [ipaddress.ip_network(n) for n in (WAN_IP, WAN_IPV6_PREFIX) if n]
+] + _wan_nets
 
 # Match suricata.yaml HOME_NET — used to decide which side is the attacker.
-HOME_NETS = [ipaddress.ip_network("192.168.0.0/16")] + [
-    ipaddress.ip_network(n) for n in (WAN_IP, WAN_IPV6_PREFIX) if n
-]
+HOME_NETS = [ipaddress.ip_network("192.168.0.0/16")] + _wan_nets
 
 _recent: dict[str, float] = {}
 _quiet_blocks = 0
