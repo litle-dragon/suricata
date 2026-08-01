@@ -41,6 +41,7 @@ QUIET_PREFIXES = ("ET DROP", "ET CINS", "ET TOR", "ET 3CORESec")
 
 TG_TOKEN = os.environ.get("TG_TOKEN", "")  # empty = skip Telegram, log only
 TG_CHAT = os.environ.get("TG_CHAT", "")
+TG_THREAD_ID = os.environ.get("TG_THREAD_ID", "")
 MT_HOST = os.environ.get("MT_HOST", "")
 MT_USER = os.environ.get("MT_USER", "")
 MT_PASS = os.environ["MT_PASS"]
@@ -114,10 +115,16 @@ def cooled_down(key: str) -> bool:
 def telegram_send(text: str) -> None:
     if not TG_TOKEN or not TG_CHAT:
         return  # Telegram not configured yet — alerts still logged + blocked
+    payload = {"chat_id": TG_CHAT, "text": text}
+    if TG_THREAD_ID:
+        try:
+            payload["message_thread_id"] = int(TG_THREAD_ID)
+        except ValueError:
+            pass
     try:
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": text},
+            json=payload,
             timeout=10,
         )
     except requests.RequestException as e:

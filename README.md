@@ -381,9 +381,9 @@ Install it from this repo:
 
 ```bash
 sudo mkdir /opt/alert-bridge/
-sudo curl -o /opt/alert-bridge/alert-bridge.py https://raw.githubusercontent.com/filip-lebiecki/suricata/main/alert-bridge.py
-sudo curl -o /opt/alert-bridge/env https://raw.githubusercontent.com/filip-lebiecki/suricata/main/env.example
-sudo curl -o /etc/systemd/system/alert-bridge.service https://raw.githubusercontent.com/filip-lebiecki/suricata/main/alert-bridge.service
+sudo curl -o /opt/alert-bridge/alert-bridge.py https://raw.githubusercontent.com/litle-dragon/suricata/main/alert-bridge.py
+sudo curl -o /opt/alert-bridge/env https://raw.githubusercontent.com/litle-dragon/suricata/main/env.example
+sudo curl -o /etc/systemd/system/alert-bridge.service https://raw.githubusercontent.com/litle-dragon/suricata/main/alert-bridge.service
 sudo chmod 600 /opt/alert-bridge/env
 sudo systemctl daemon-reload
 ```
