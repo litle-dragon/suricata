@@ -144,7 +144,7 @@ def mikrotik_block(ip: str, signature: str) -> bool:
             },
             auth=(MT_USER, MT_PASS),
             verify=False,
-            timeout=5,
+            timeout=(5, 15),  # 5s connect, 15s read timeout
         )
         # 400 "already have such entry" is fine — it's already blocked
         return r.status_code in (200, 201) or "already" in r.text
