@@ -3,19 +3,13 @@
 
 Follows eve.json like `tail -F` (survives logrotate), and for every alert
 with severity <= MAX_SEVERITY:
-  - adds the attacker IP to a MikroTik address-list with a timeout
-  - sends one Telegram message (rate-limited per attacker+signature) —
-    except pure reputation-list hits (QUIET_PREFIXES), which are blocked
-    silently and rolled up into a one-line daily digest
-
-Config via environment (see alert-bridge.service):
-  TG_TOKEN   Telegram bot token
-  TG_CHAT    Telegram chat id
-   MT_HOST    MikroTik address, e.g. 192.168.12.200
-   MT_USER    REST API user (default: suricata)
-   MT_PASS    REST API password
-   WAN_IP            own WAN public IP (CIDR, e.g. 203.0.113.5/32)
-   WAN_IPV6_PREFIX   own IPv6 prefix (CIDR, e.g. 2001:db8::/64)
+  - Classifies flow into Inbound (external attacker -> LAN) or Outbound (LAN -> external target)
+  - Tracks daily attempt history per IP for both directions with persistent state (/var/log/suricata/alert-bridge-state.json)
+  - Inbound traffic: 1h block for hits 1-2. Escalates to PERMANENT block on MikroTik at hit >= 3
+    with a priority Telegram alert.
+  - Outbound traffic: always 1h temporary block on MikroTik. Every 6 hours, sends a Telegram
+    summary digest listing all outbound target IPs with >= 3 hits today.
+  - Rate-limits Telegram messages (COOLDOWN) except for permanent block escalation.
 """
 
 import ipaddress
@@ -29,14 +23,15 @@ import urllib3
 urllib3.disable_warnings()  # self-signed cert on the router's www-ssl
 
 EVE_LOG = "/var/log/suricata/eve.json"
+STATE_FILE = "/var/log/suricata/alert-bridge-state.json"
 MAX_SEVERITY = 2          # 1=high, 2=medium; 3=informational is ignored
-BLOCK_TIMEOUT = "1h"      # address-list entry lifetime on the router
+BLOCK_TIMEOUT = os.environ.get("BLOCK_TIMEOUT", "1h")  # temporary block duration
 COOLDOWN = 300            # seconds before re-alerting same ip+signature
 BLOCK_LIST = "suricata-block"
+PERMANENT_THRESHOLD = 3   # Inbound attempts today before permanent block
+OUTBOUND_SUMMARY_INTERVAL = 6 * 3600  # 6 hours in seconds
 
 # Reputation-list hits: real enough to block, too common to page about
-# (~270/day of background internet scanning on this WAN). Still blocked,
-# just not messaged — counted into the daily digest instead.
 QUIET_PREFIXES = ("ET DROP", "ET CINS", "ET TOR", "ET 3CORESec")
 
 TG_TOKEN = os.environ.get("TG_TOKEN", "")  # empty = skip Telegram, log only
@@ -44,7 +39,7 @@ TG_CHAT = os.environ.get("TG_CHAT", "")
 TG_THREAD_ID = os.environ.get("TG_THREAD_ID", "")
 MT_HOST = os.environ.get("MT_HOST", "")
 MT_USER = os.environ.get("MT_USER", "")
-MT_PASS = os.environ["MT_PASS"]
+MT_PASS = os.environ.get("MT_PASS", "")
 WAN_IP = os.environ.get("WAN_IP", "")            # own WAN public IP(s) (CIDR, comma-separated for multi-WAN)
 WAN_IPV6_PREFIX = os.environ.get("WAN_IPV6_PREFIX", "")  # own IPv6 prefix(es)
 
@@ -86,12 +81,57 @@ WHITELIST = [
     )
 ] + _wan_nets
 
-# Match suricata.yaml HOME_NET — used to decide which side is the attacker.
+# Match suricata.yaml HOME_NET — used to decide direction of traffic.
 HOME_NETS = [ipaddress.ip_network("192.168.0.0/16")] + _wan_nets
 
 _recent: dict[str, float] = {}
+_daily_inbound_counts: dict[str, int] = {}
+_daily_outbound_counts: dict[str, int] = {}
 _quiet_blocks = 0
 _digest_day = time.strftime("%Y-%m-%d")
+_last_outbound_summary_time = time.time()
+
+
+def load_state() -> None:
+    """Load persistent counters and state from JSON file if available."""
+    global _digest_day, _quiet_blocks, _daily_inbound_counts, _daily_outbound_counts, _last_outbound_summary_time
+    today = time.strftime("%Y-%m-%d")
+    if not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE, "r") as f:
+            data = json.load(f)
+        saved_date = data.get("date", "")
+        if saved_date == today:
+            _digest_day = saved_date
+            _quiet_blocks = data.get("quiet_blocks", 0)
+            _daily_inbound_counts = data.get("inbound_counts", {})
+            _daily_outbound_counts = data.get("outbound_counts", {})
+            _last_outbound_summary_time = data.get("last_outbound_summary_time", time.time())
+            print(f"loaded state for {today}: {_quiet_blocks} quiet blocks, "
+                  f"{len(_daily_inbound_counts)} inbound IPs, {len(_daily_outbound_counts)} outbound IPs", flush=True)
+        else:
+            print(f"state file is from previous day ({saved_date}), starting fresh for {today}", flush=True)
+    except Exception as e:
+        print(f"warning: failed to load state file: {e}", flush=True)
+
+
+def save_state() -> None:
+    """Atomically save current state to JSON file."""
+    state = {
+        "date": _digest_day,
+        "quiet_blocks": _quiet_blocks,
+        "inbound_counts": _daily_inbound_counts,
+        "outbound_counts": _daily_outbound_counts,
+        "last_outbound_summary_time": _last_outbound_summary_time,
+    }
+    tmp_path = STATE_FILE + ".tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp_path, STATE_FILE)
+    except Exception as e:
+        print(f"warning: failed to save state file: {e}", flush=True)
 
 
 def whitelisted(ip: str) -> bool:
@@ -99,15 +139,31 @@ def whitelisted(ip: str) -> bool:
     return any(addr in net for net in WHITELIST)
 
 
-def pick_attacker(ev: dict) -> str:
-    """The side of the flow that is NOT ours."""
+def classify_flow(ev: dict) -> tuple[str, str, str]:
+    """
+    Returns (direction, target_ip, internal_ip)
+    direction: 'inbound' or 'outbound'
+    """
     src = ev.get("src_ip", "")
+    dest = ev.get("dest_ip", "")
+
+    src_home = False
+    dest_home = False
     try:
-        if any(ipaddress.ip_address(src) in n for n in HOME_NETS):
-            return ev.get("dest_ip", "")
+        if src:
+            src_home = any(ipaddress.ip_address(src) in n for n in HOME_NETS)
+        if dest:
+            dest_home = any(ipaddress.ip_address(dest) in n for n in HOME_NETS)
     except ValueError:
         pass
-    return src
+
+    if not src_home and dest_home:
+        return "inbound", src, dest
+    elif src_home and not dest_home:
+        return "outbound", dest, src
+    else:
+        # Fallback: if src is not home, treat as inbound
+        return ("inbound", src, dest) if not src_home else ("outbound", dest, src)
 
 
 def cooled_down(key: str) -> bool:
@@ -140,17 +196,21 @@ def telegram_send(text: str) -> None:
         print(f"telegram failed: {e}", flush=True)
 
 
-def mikrotik_block(ip: str, signature: str) -> bool:
+def mikrotik_block(ip: str, signature: str, permanent: bool = False) -> bool:
     family = "ipv6" if ipaddress.ip_address(ip).version == 6 else "ip"
+    comment_prefix = "PERMANENT (3+ hits): " if permanent else ""
+    body = {
+        "list": BLOCK_LIST,
+        "address": ip,
+        "comment": (comment_prefix + signature)[:60],
+    }
+    if not permanent:
+        body["timeout"] = BLOCK_TIMEOUT
+
     try:
         r = requests.put(
             f"https://{MT_HOST}/rest/{family}/firewall/address-list",
-            json={
-                "list": BLOCK_LIST,
-                "address": ip,
-                "timeout": BLOCK_TIMEOUT,
-                "comment": signature[:60],
-            },
+            json=body,
             auth=(MT_USER, MT_PASS),
             verify=False,
             timeout=(5, 15),  # 5s connect, 15s read timeout
@@ -162,17 +222,39 @@ def mikrotik_block(ip: str, signature: str) -> bool:
         return False
 
 
-def maybe_send_digest() -> None:
-    """First alert of a new day flushes yesterday's quiet-block count."""
-    global _quiet_blocks, _digest_day
+def check_periodic_tasks() -> None:
+    """Checks for midnight day-rollover and 6-hour outbound summary digest."""
+    global _quiet_blocks, _digest_day, _daily_inbound_counts, _daily_outbound_counts, _last_outbound_summary_time
+    now = time.time()
     today = time.strftime("%Y-%m-%d")
-    if today == _digest_day:
-        return
-    if _quiet_blocks:
-        telegram_send(f"🌦 {_digest_day}: silently blocked {_quiet_blocks} "
-                      "reputation-listed IPs (ET DROP/CINS/TOR)")
-    _digest_day = today
-    _quiet_blocks = 0
+
+    # 1. Day Rollover at Midnight
+    if today != _digest_day:
+        if _quiet_blocks:
+            telegram_send(f"🌦 {_digest_day}: silently blocked {_quiet_blocks} "
+                          "reputation-listed IPs (ET DROP/CINS/TOR)")
+        _digest_day = today
+        _quiet_blocks = 0
+        _daily_inbound_counts.clear()
+        _daily_outbound_counts.clear()
+        _last_outbound_summary_time = now
+        save_state()
+
+    # 2. 6-Hour Outbound Summary Digest
+    if now - _last_outbound_summary_time >= OUTBOUND_SUMMARY_INTERVAL:
+        _last_outbound_summary_time = now
+        frequent_outbound = {
+            ip: count for ip, count in _daily_outbound_counts.items() if count >= 3
+        }
+        if frequent_outbound:
+            lines = [f"• `{ip}` — {count} hits" for ip, count in sorted(frequent_outbound.items(), key=lambda x: x[1], reverse=True)]
+            text = (
+                "📊 Outbound Summary (6h Digest) 📤\n"
+                f"Targets with >= 3 hits today ({today}):\n"
+                + "\n".join(lines)
+            )
+            telegram_send(text)
+        save_state()
 
 
 def follow(path: str):
@@ -183,8 +265,6 @@ def follow(path: str):
     while True:
         try:
             st = os.stat(path)
-            # (Re)open when: first run, inode changed (rotation/recreate),
-            # or the file shrank below our read position (truncation, same inode).
             if f is None or st.st_ino != inode or st.st_size < pos:
                 if f:
                     f.close()
@@ -197,15 +277,19 @@ def follow(path: str):
                 pos = f.tell()
                 yield line
             else:
+                check_periodic_tasks()
                 time.sleep(0.5)
         except FileNotFoundError:
+            check_periodic_tasks()
             time.sleep(1)
 
 
 def main() -> None:
     global _quiet_blocks
+    load_state()
     print(f"following {EVE_LOG}, blocking via {MT_HOST}", flush=True)
     for line in follow(EVE_LOG):
+        check_periodic_tasks()
         try:
             ev = json.loads(line)
         except json.JSONDecodeError:
@@ -216,29 +300,72 @@ def main() -> None:
         if alert.get("severity", 3) > MAX_SEVERITY:
             continue
 
-        attacker = pick_attacker(ev)
-        if not attacker or whitelisted(attacker):
-            continue
-        if not cooled_down(f"{attacker}|{alert.get('signature_id')}"):
+        direction, target_ip, internal_ip = classify_flow(ev)
+        if not target_ip or whitelisted(target_ip):
             continue
 
-        maybe_send_digest()
         sig = alert.get("signature", "")
-        blocked = mikrotik_block(attacker, sig)
         quiet = sig.startswith(QUIET_PREFIXES)
-        if quiet:
-            _quiet_blocks += 1
+
+        if direction == "inbound":
+            _daily_inbound_counts[target_ip] = _daily_inbound_counts.get(target_ip, 0) + 1
+            attempts = _daily_inbound_counts[target_ip]
+            permanent = attempts >= PERMANENT_THRESHOLD
+
+            if not permanent and not cooled_down(f"inbound|{target_ip}|{alert.get('signature_id')}"):
+                save_state()
+                continue
+
+            blocked = mikrotik_block(target_ip, sig, permanent=permanent)
+
+            if permanent:
+                # Always send Telegram alert for permanent blocks regardless of quiet prefix
+                telegram_send(
+                    "🔒 PERMANENT BLOCK (Inbound 📥)\n"
+                    f"Attacker IP {target_ip} reached {attempts} attack attempts today!\n"
+                    f"Signature: {sig}\n"
+                    f"{ev.get('src_ip')}:{ev.get('src_port', '')} → {ev.get('dest_ip')}:{ev.get('dest_port', '')}\n"
+                    f"Severity {alert.get('severity')} · "
+                    + (f"🔒 PERMANENTLY BLOCKED on MikroTik" if blocked else "⚠️ Permanent block FAILED")
+                )
+            elif quiet:
+                _quiet_blocks += 1
+            else:
+                telegram_send(
+                    "🚨 Suricata alert (Inbound 📥)\n"
+                    f"{sig}\n"
+                    f"{ev.get('src_ip')}:{ev.get('src_port', '')} → {ev.get('dest_ip')}:{ev.get('dest_port', '')}\n"
+                    f"severity {alert.get('severity')} · attempt {attempts}/{PERMANENT_THRESHOLD} today · "
+                    + (f"⛔ blocked {BLOCK_TIMEOUT}" if blocked else "⚠️ block FAILED")
+                )
+            print(f"inbound-alert {sig} attacker={target_ip} attempts={attempts} "
+                  f"permanent={permanent} blocked={blocked}", flush=True)
+
         else:
-            telegram_send(
-                "🚨 Suricata alert\n"
-                f"{sig}\n"
-                f"{ev.get('src_ip')}:{ev.get('src_port', '')} → "
-                f"{ev.get('dest_ip')}:{ev.get('dest_port', '')}\n"
-                f"severity {alert.get('severity')} · "
-                + (f"⛔ blocked {BLOCK_TIMEOUT}" if blocked else "⚠️ block FAILED")
-            )
-        print(f"alert {sig} attacker={attacker} "
-              f"blocked={blocked} paged={not quiet}", flush=True)
+            # Outbound traffic (LAN -> WAN)
+            _daily_outbound_counts[target_ip] = _daily_outbound_counts.get(target_ip, 0) + 1
+            attempts = _daily_outbound_counts[target_ip]
+
+            if not cooled_down(f"outbound|{target_ip}|{alert.get('signature_id')}"):
+                save_state()
+                continue
+
+            blocked = mikrotik_block(target_ip, sig, permanent=False)
+
+            if quiet:
+                _quiet_blocks += 1
+            else:
+                telegram_send(
+                    "🚨 Suricata alert (Outbound 📤)\n"
+                    f"{sig}\n"
+                    f"{ev.get('src_ip')}:{ev.get('src_port', '')} → {ev.get('dest_ip')}:{ev.get('dest_port', '')}\n"
+                    f"severity {alert.get('severity')} · hit {attempts} today · "
+                    + (f"⛔ blocked {BLOCK_TIMEOUT}" if blocked else "⚠️ block FAILED")
+                )
+            print(f"outbound-alert {sig} target={target_ip} hits={attempts} "
+                  f"blocked={blocked}", flush=True)
+
+        save_state()
 
 
 if __name__ == "__main__":
