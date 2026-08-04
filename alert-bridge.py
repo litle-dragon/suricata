@@ -310,7 +310,14 @@ def main() -> None:
         if direction == "inbound":
             _daily_inbound_counts[target_ip] = _daily_inbound_counts.get(target_ip, 0) + 1
             attempts = _daily_inbound_counts[target_ip]
-            permanent = attempts >= PERMANENT_THRESHOLD
+
+            if attempts > PERMANENT_THRESHOLD:
+                # Already permanently blocked on MikroTik on the 3rd attempt.
+                # Ignore subsequent mirrored packets to prevent Telegram spam.
+                save_state()
+                continue
+
+            permanent = (attempts == PERMANENT_THRESHOLD)
 
             if not permanent and not cooled_down(f"inbound|{target_ip}|{alert.get('signature_id')}"):
                 save_state()
@@ -319,7 +326,7 @@ def main() -> None:
             blocked = mikrotik_block(target_ip, sig, permanent=permanent)
 
             if permanent:
-                # Always send Telegram alert for permanent blocks regardless of quiet prefix
+                # Sent EXACTLY ONCE on the 3rd attempt when escalating to PERMANENT block
                 telegram_send(
                     "🔒 PERMANENT BLOCK (Inbound 📥)\n"
                     f"Attacker IP {target_ip} reached {attempts} attack attempts today!\n"
