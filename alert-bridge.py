@@ -82,7 +82,10 @@ WHITELIST = [
 ] + _wan_nets
 
 # Match suricata.yaml HOME_NET — used to decide direction of traffic.
-HOME_NETS = [ipaddress.ip_network("192.168.0.0/16")] + _wan_nets
+HOME_NETS = [
+    ipaddress.ip_network(n)
+    for n in ("192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "100.64.0.0/10")
+] + _wan_nets
 
 _recent: dict[str, float] = {}
 _daily_inbound_counts: dict[str, int] = {}
@@ -135,8 +138,11 @@ def save_state() -> None:
 
 
 def whitelisted(ip: str) -> bool:
-    addr = ipaddress.ip_address(ip)
-    return any(addr in net for net in WHITELIST)
+    try:
+        addr = ipaddress.ip_address(ip)
+        return any(addr in net for net in WHITELIST)
+    except ValueError:
+        return False
 
 
 def classify_flow(ev: dict) -> tuple[str, str, str]:
@@ -199,6 +205,34 @@ def telegram_send(text: str) -> None:
 def mikrotik_block(ip: str, signature: str, permanent: bool = False) -> bool:
     family = "ipv6" if ipaddress.ip_address(ip).version == 6 else "ip"
     comment_prefix = "PERMANENT (3+ hits): " if permanent else ""
+    base_url = f"https://{MT_HOST}/rest/{family}/firewall/address-list"
+    auth = (MT_USER, MT_PASS)
+
+    if permanent:
+        try:
+            # Check if entry currently exists and is temporary
+            r_get = requests.get(
+                f"{base_url}?list={BLOCK_LIST}&address={ip}",
+                auth=auth,
+                verify=False,
+                timeout=(5, 10),
+            )
+            if r_get.status_code == 200:
+                entries = r_get.json()
+                if isinstance(entries, list):
+                    for entry in entries:
+                        if entry.get("timeout") or entry.get("dynamic") == "true":
+                            entry_id = entry.get(".id")
+                            if entry_id:
+                                requests.delete(
+                                    f"{base_url}/{entry_id}",
+                                    auth=auth,
+                                    verify=False,
+                                    timeout=(5, 10),
+                                )
+        except requests.RequestException as e:
+            print(f"mikrotik lookup/delete failed for {ip}: {e}", flush=True)
+
     body = {
         "list": BLOCK_LIST,
         "address": ip,
@@ -209,9 +243,9 @@ def mikrotik_block(ip: str, signature: str, permanent: bool = False) -> bool:
 
     try:
         r = requests.put(
-            f"https://{MT_HOST}/rest/{family}/firewall/address-list",
+            base_url,
             json=body,
-            auth=(MT_USER, MT_PASS),
+            auth=auth,
             verify=False,
             timeout=(5, 15),  # 5s connect, 15s read timeout
         )
