@@ -352,32 +352,38 @@ add chain=forward in-interface=WAN2 out-interface-list=LAN \
     comment="Suricata: WAN -> LAN, post-dstnat"
 ```
 
-Verified on an RB5009 (RouterOS 7.23.2): a 12-second capture produced 495
-packets, **none** of which carried the public IP, and five distinct
-`192.168.x.x` hosts were individually identifiable. With `/tool sniffer` the
-same traffic collapses to one public address.
+The difference is immediate once packets start flowing: a capture on `tzsp0`
+shows individual `192.168.x.x` hosts as sources and destinations, and your
+public IP appears nowhere. Under Step 6, that same traffic collapses to a
+single public address. (Confirmed on RouterOS 7.x; `sniff-tzsp` has been
+available since RouterOS 6.)
 
 ### What this changes
 
 **Populate the `LAN` interface list first.** RouterOS ships this list
 *empty*. If you skip this, both rules match nothing and you'll see zero
-packets with no error anywhere:
+packets with no error anywhere. Add every LAN-side interface — your bridge,
+or each VLAN individually if your LAN is segmented:
 
 ```routeros
 /interface list member
-add list=LAN interface=vlan12
-add list=LAN interface=vlan80
-# …one line per LAN-side VLAN/bridge
+add list=LAN interface=bridge
+# …or, on a VLAN-segmented network, one line per VLAN:
+# add list=LAN interface=vlan10
+# add list=LAN interface=vlan20
 ```
+
+Check what you actually have with `/interface print`. Whatever you leave out
+is simply invisible to Suricata.
 
 **Use `out-interface-list=LAN`, not `out-interface=LAN`,** in the return
 rule — `out-interface` expects an interface *name*, and a list name silently
 won't resolve.
 
 **`HOME_NET` gets simpler.** Since Suricata now sees pre-NAT addresses, your
-public IP is no longer required — `192.168.0.0/16` covers your hosts. Leaving
-the public IP in place does no harm, so if you're switching between the two
-methods, keep it.
+public IP is no longer required — the RFC1918 ranges already in the Step 4
+`HOME_NET` cover your hosts. Leaving the public IP in place does no harm, so
+if you're switching between the two methods, keep it.
 
 **One rule pair per WAN.** These rules are scoped to a single interface
 (`WAN2`). On a multi-WAN or failover router, traffic over the other uplink is
@@ -436,23 +442,23 @@ TLS `ClientHello` (so SNI and JA3 survive), ICMP, and anything the FastTrack
 rule doesn't cover — but not the bulk of an established session. Plenty of
 signatures still fire; payload-inspection rules mostly won't.
 
-So, honestly:
-
-| Your router | What to expect |
-|---|---|
-| No FastTrack rule (e.g. policy routing / mark-based multi-WAN, which is incompatible with FastTrack anyway) | Full mirror of forwarded traffic, pre-NAT addresses |
-| FastTrack enabled, left alone | Partial mirror: connection setup and metadata only |
-| FastTrack enabled, want full coverage | You must exclude the traffic from FastTrack — at which point you're paying the CPU cost you were trying to avoid |
-
-The test above was run on a router with **no** FastTrack rule, which is why
-every forwarded packet showed up. Check yours before assuming the same:
+So check your own router before choosing — this one command decides which row
+you're in:
 
 ```routeros
 /ip firewall filter print where action=fasttrack-connection
 ```
 
-Empty output means nothing is being fasttracked, and every packet crossing
-the chains you hooked will be mirrored.
+| Result | What to expect |
+|---|---|
+| **No rule** (empty output) — common on routers doing policy routing or mark-based multi-WAN, which are incompatible with FastTrack anyway | Full mirror of forwarded traffic, pre-NAT addresses |
+| **A rule exists**, and you leave it alone | Partial mirror: connection setup and metadata only |
+| **A rule exists**, and you want full coverage | You must exclude the traffic from FastTrack — at which point you're paying the CPU cost you were trying to avoid |
+
+RouterOS's default firewall *does* ship a FastTrack rule, so unless you've
+built your own ruleset, assume you're in the second row until you've checked.
+If the output is empty, every packet crossing the chains you hooked will be
+mirrored.
 
 ### Verifying
 
@@ -669,9 +675,10 @@ sudo ss -ulnp | grep 37008
 ```
 
 **TZSP arrives, but tzsp0 stays silent — and `tcpreplay` claims success.**
-This one is nasty, because nothing reports an error. `tcpreplay` prints
-`Successful packets: 40 / Failed packets: 0` while *zero* packets actually
-reach the interface. The giveaway is in the journal:
+This one is nasty, because nothing reports an error. `tcpreplay` prints a
+healthy-looking `Successful packets: N / Failed packets: 0` while *zero*
+packets actually reach the interface. The giveaway is in the journal
+(`journalctl -u tzsp-receiver`), repeating on a loop:
 
 ```
 TP_STATUS_WRONG_FORMAT occures O_o. Frame 1660, pkt len 70
