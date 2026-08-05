@@ -36,7 +36,7 @@ def load_env():
                         k, v = line.split("=", 1)
                         k = k.strip()
                         v = v.strip().strip("'\"")
-                        if v and not os.environ.get(k):
+                        if v:
                             os.environ[k] = v
         except PermissionError:
             print(f"Warning: Permission denied reading {env_path}. Run with 'sudo' to read MikroTik credentials.", file=sys.stderr)
@@ -144,8 +144,11 @@ def sync_subnets_to_mikrotik(subnets_to_block: list[tuple[str, int, int]]):
     mt_pass = os.environ.get("MT_PASS", "")
     block_list = os.environ.get("BLOCK_LIST", "suricata-block")
     if not mt_host or not mt_user or not mt_pass or "YOUR_" in mt_host or "YOUR_" in mt_pass:
-        print("\nError: MikroTik credentials (MT_HOST, MT_USER, MT_PASS) missing or unconfigured in /opt/alert-bridge/env.", file=sys.stderr)
-        print("Make sure /opt/alert-bridge/env is configured and run with 'sudo python3 analyze_stats.py --sync-mikrotik'.", file=sys.stderr)
+        print("\nError: MikroTik credentials incomplete in /opt/alert-bridge/env:", file=sys.stderr)
+        print(f"  MT_HOST = '{mt_host}'", file=sys.stderr)
+        print(f"  MT_USER = '{mt_user}'", file=sys.stderr)
+        print(f"  MT_PASS = {'(set)' if mt_pass and 'YOUR_' not in mt_pass else '(missing or unconfigured)'}", file=sys.stderr)
+        print("Please edit /opt/alert-bridge/env with your router LAN IP and suricata API user password.", file=sys.stderr)
         return
     if not subnets_to_block:
         print("\nNo subnets matched the threshold (>= 10 unique IPs) to sync to MikroTik.")
