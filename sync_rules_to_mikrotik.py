@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Sync Suricata malicious subnets (from parse_rules_ips.py / malicious_subnets.txt) to MikroTik.
+"""Sync Suricata malicious subnets/IPs to MikroTik via REST API (Option A: Fast RSC Upload & Import).
 
-Modes:
-  1. Fast RSC Mode (--generate-rsc blocklist.rsc):
-     Generates a single RouterOS script file for instant bulk import (/import file-name=blocklist.rsc).
-  2. REST API Differential Sync (--api / default):
-     Reads current MikroTik address-list via REST API, adds missing subnets, and cleans up redundant single IPs.
+Option A:
+  1. Reads malicious IPs/subnets from /opt/alert-bridge/malicious_subnets.txt
+  2. Deduplicates single IPs covered by larger subnets
+  3. Generates RouterOS script (.rsc)
+  4. Uploads file to MikroTik via REST API (POST /rest/file)
+  5. Executes '/import file-name=suricata_rules.rsc' via REST API (POST /rest/import or /rest/execute)
 """
 
 import argparse
@@ -39,43 +40,111 @@ def load_env():
             print(f"Warning: failed to read {env_path}: {e}", file=sys.stderr)
 
 
-def load_malicious_subnets(path: str) -> list[str]:
+def load_malicious_items(path: str) -> list[str]:
     if not os.path.exists(path):
         print(f"Error: subnets file '{path}' not found. Run parse_rules_ips.py first.", file=sys.stderr)
         return []
 
-    subnets = set()
+    items = set()
     with open(path, "r") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#"):
-                try:
-                    net = ipaddress.ip_network(line, strict=False)
-                    subnets.add(str(net))
-                except ValueError:
-                    pass
-    return sorted(list(subnets))
+                items.add(line)
+
+    return sorted(list(items))
 
 
-def generate_rsc_file(subnets: list[str], output_rsc: str, list_name: str):
+def deduplicate_subnets_and_ips(items: list[str]) -> list[str]:
     """
-    Generates a fast RouterOS import script (.rsc) for bulk address-list updates in 1-2 seconds.
+    Deduplicates list of IPs and CIDRs:
+    Removes individual single IPs (/32 or /128) if they fall inside a larger subnet in the list.
     """
-    with open(output_rsc, "w") as f:
-        f.write(f"# Auto-generated MikroTik import script for Suricata rules subnets\n")
-        f.write(f"/ip firewall address-list remove [find list={list_name}]\n")
-        f.write(f"/ip firewall address-list\n")
-        for net_str in subnets:
-            f.write(f"add list={list_name} address={net_str} comment=\"ET Rule Subnet\"\n")
+    subnets = []
+    single_ips = []
 
-    print(f"✅ Fast RouterOS script generated: '{output_rsc}' ({len(subnets)} subnets).")
-    print(f"👉 Upload to MikroTik and run: /import file-name={output_rsc}")
+    for item in items:
+        try:
+            net = ipaddress.ip_network(item, strict=False)
+            if (net.version == 4 and net.prefixlen < 32) or (net.version == 6 and net.prefixlen < 128):
+                subnets.append(net)
+            else:
+                single_ips.append(net)
+        except ValueError:
+            pass
 
-def sync_api_mikrotik(subnets: list[str], list_name: str):
-    """
-    Differential sync via RouterOS REST API.
-    Adds missing subnets and removes single IPs covered by subnets.
-    """
+    # Remove single IPs that are covered by any subnet
+    filtered_ips = []
+    for ip_net in single_ips:
+        ip_addr = ip_net.network_address
+        if not any(ip_addr in sub_net for sub_net in subnets):
+            filtered_ips.append(ip_net)
+
+    combined = subnets + filtered_ips
+    combined.sort(key=lambda x: (x.version, x.network_address, x.prefixlen))
+    return [str(net) for net in combined]
+
+
+def generate_rsc_content(subnets: list[str], list_name: str) -> str:
+    lines = [
+        f"# Auto-generated MikroTik import script for Suricata rules subnets",
+        f"/ip firewall address-list remove [find list={list_name}]",
+        f"/ip firewall address-list",
+    ]
+    for net_str in subnets:
+        lines.append(f"add list={list_name} address={net_str} comment=\"ET Rule Subnet\"")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def upload_and_import_rsc(mt_host: str, auth: tuple[str, str], list_name: str, rsc_text: str, file_name: str = "suricata_rules.rsc") -> bool:
+    base_url = f"https://{mt_host}/rest"
+
+    # 1. Upload .rsc file content to MikroTik
+    upload_url = f"{base_url}/file"
+    upload_payload = {
+        "name": file_name,
+        "contents": rsc_text
+    }
+    print(f"📤 Uploading '{file_name}' to MikroTik REST API ({mt_host})...", flush=True)
+    try:
+        r_up = requests.post(upload_url, json=upload_payload, auth=auth, verify=False, timeout=(5, 15))
+        if r_up.status_code not in (200, 201):
+            # Fallback: PUT /rest/file/<file_name>
+            r_up = requests.put(f"{base_url}/file/{file_name}", json={"contents": rsc_text}, auth=auth, verify=False, timeout=(5, 15))
+            if r_up.status_code not in (200, 201):
+                print(f"  Warning: REST API file upload response: {r_up.status_code} {r_up.text}", flush=True)
+    except requests.RequestException as e:
+        print(f"  Warning: REST API upload request failed: {e}", flush=True)
+
+    # 2. Execute /import file-name=suricata_rules.rsc via REST API
+    print(f"⚡ Executing import on MikroTik: /import file-name={file_name} ...", flush=True)
+    try:
+        r_imp = requests.post(f"{base_url}/import", json={"file-name": file_name}, auth=auth, verify=False, timeout=(5, 30))
+        if r_imp.status_code in (200, 201):
+            print(f"✅ Successfully imported into MikroTik address-list '{list_name}'!", flush=True)
+            return True
+        else:
+            # Fallback: try /rest/execute
+            r_exec = requests.post(f"{base_url}/execute", json={"script": f"/import file-name={file_name}"}, auth=auth, verify=False, timeout=(5, 30))
+            if r_exec.status_code in (200, 201):
+                print(f"✅ Successfully executed import script on MikroTik address-list '{list_name}'!", flush=True)
+                return True
+            else:
+                print(f"⚠️ Import command response: {r_exec.status_code} {r_exec.text}", flush=True)
+                return False
+    except requests.RequestException as e:
+        print(f"⚠️ Import request failed: {e}", flush=True)
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Sync Suricata malicious subnets to MikroTik via REST API (Option A).")
+    parser.add_argument("--subnets-file", default="/opt/alert-bridge/malicious_subnets.txt", help="Path to malicious subnets file")
+    parser.add_argument("--list-name", default="suricata-block", help="MikroTik address-list name (default: suricata-block)")
+    parser.add_argument("--save-rsc", help="Save generated .rsc to local file as well")
+    args = parser.parse_args()
+
     if requests is None:
         print("Error: 'requests' module not installed. Install with: sudo apt install python3-requests", file=sys.stderr)
         return
@@ -86,88 +155,33 @@ def sync_api_mikrotik(subnets: list[str], list_name: str):
     mt_pass = os.environ.get("MT_PASS", "")
 
     if not mt_host or not mt_user or not mt_pass or "YOUR_" in mt_host or "YOUR_" in mt_pass:
-        print("\nError: MikroTik credentials (MT_HOST, MT_USER, MT_PASS) missing or unconfigured in /opt/alert-bridge/env.", file=sys.stderr)
+        print("\nError: MikroTik credentials incomplete in /opt/alert-bridge/env:", file=sys.stderr)
+        print(f"  MT_HOST = '{mt_host}'", file=sys.stderr)
+        print(f"  MT_USER = '{mt_user}'", file=sys.stderr)
+        print(f"  MT_PASS = {'(set)' if mt_pass and 'YOUR_' not in mt_pass else '(missing or unconfigured)'}", file=sys.stderr)
+        print("Please edit /opt/alert-bridge/env with your router LAN IP and suricata API user password.", file=sys.stderr)
         return
+
+    raw_items = load_malicious_items(args.subnets_file)
+    if not raw_items:
+        return
+
+    print(f"Loaded {len(raw_items)} items from '{args.subnets_file}'. Deduplicating...", flush=True)
+    optimized_items = deduplicate_subnets_and_ips(raw_items)
+    print(f"Optimized to {len(optimized_items)} unique subnets/IPs (removed single IPs covered by subnets).", flush=True)
+
+    rsc_content = generate_rsc_content(optimized_items, args.list_name)
+
+    if args.save_rsc:
+        try:
+            with open(args.save_rsc, "w") as f:
+                f.write(rsc_content)
+            print(f"Saved local RSC script copy to '{args.save_rsc}'.", flush=True)
+        except Exception as e:
+            print(f"Warning: failed to save local RSC file: {e}", file=sys.stderr)
 
     auth = (mt_user, mt_pass)
-    base_url = f"https://{mt_host}/rest/ip/firewall/address-list"
-
-    print(f"🔍 Reading current address-list '{list_name}' from MikroTik ({mt_host})...")
-
-    # 1. Fetch current list entries
-    existing_entries = []
-    try:
-        r = requests.get(f"{base_url}?list={list_name}", auth=auth, verify=False, timeout=(5, 15))
-        if r.status_code == 200:
-            existing_entries = r.json()
-    except requests.RequestException as e:
-        print(f"Error fetching address-list from MikroTik: {e}", file=sys.stderr)
-        return
-
-    current_addresses = {entry.get("address"): entry.get(".id") for entry in existing_entries if entry.get("address")}
-
-    print(f"Found {len(current_addresses)} existing entries on MikroTik.")
-
-    # 2. Build network objects for subnets to be synced
-    subnet_objs = []
-    for s in subnets:
-        try:
-            subnet_objs.append((s, ipaddress.ip_network(s, strict=False)))
-        except ValueError:
-            pass
-
-    # 3. Clean up single IPs covered by any of the new subnets
-    redundant_removed = 0
-    for addr_str, entry_id in list(current_addresses.items()):
-        try:
-            ip_obj = ipaddress.ip_address(addr_str)
-            for sub_str, sub_net in subnet_objs:
-                if ip_obj in sub_net:
-                    print(f"  🗑️ Removing single IP {addr_str} (covered by rule subnet {sub_str})...", flush=True)
-                    try:
-                        requests.delete(f"{base_url}/{entry_id}", auth=auth, verify=False, timeout=(5, 10))
-                        redundant_removed += 1
-                    except requests.RequestException:
-                        pass
-                    break
-        except ValueError:
-            pass
-
-    # 4. Add missing subnets to MikroTik
-    added_subnets = 0
-    for sub_str, _ in subnet_objs:
-        if sub_str not in current_addresses:
-            body = {
-                "list": list_name,
-                "address": sub_str,
-                "comment": "ET Rule Subnet",
-            }
-            try:
-                r_put = requests.put(base_url, json=body, auth=auth, verify=False, timeout=(5, 15))
-                if r_put.status_code in (200, 201) or "already" in r_put.text:
-                    added_subnets += 1
-            except requests.RequestException as e:
-                print(f"Failed to add subnet {sub_str}: {e}", file=sys.stderr)
-
-    print(f"\n✅ Sync complete! Added {added_subnets} new subnets, removed {redundant_removed} redundant single IPs.")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Sync Suricata malicious subnets to MikroTik firewall address-list.")
-    parser.add_argument("--subnets-file", default="/opt/alert-bridge/malicious_subnets.txt", help="Path to malicious subnets file")
-    parser.add_argument("--list-name", default="suricata-block", help="MikroTik address-list name (default: suricata-block)")
-    parser.add_argument("--generate-rsc", help="Generate fast RouterOS import script (.rsc file) instead of REST API sync")
-    parser.add_argument("--api", action="store_true", help="Perform REST API differential sync")
-    args = parser.parse_args()
-
-    subnets = load_malicious_subnets(args.subnets_file)
-    if not subnets:
-        return
-
-    if args.generate_rsc:
-        generate_rsc_file(subnets, args.generate_rsc, args.list_name)
-    else:
-        sync_api_mikrotik(subnets, args.list_name)
+    upload_and_import_rsc(mt_host, auth, args.list_name, rsc_content)
 
 
 if __name__ == "__main__":
