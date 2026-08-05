@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Sync Suricata malicious subnets/IPs to MikroTik via REST API (Option A: Fast RSC Upload & Import with Chunking).
+"""Sync Suricata malicious subnets/IPs to MikroTik via REST API (Option A: Direct Execution Chunks).
 
 Option A:
   1. Reads malicious IPs/subnets from /opt/alert-bridge/malicious_subnets.txt
   2. Deduplicates single IPs covered by larger subnets
-  3. Splits large lists into 3000-item chunks to fit RouterOS REST API payload limits
-  4. Uploads chunk files to MikroTik via REST API (POST /rest/file)
-  5. Executes '/import file-name=suricata_rules_X.rsc' via REST API (POST /rest/import or /rest/execute)
+  3. Splits rule commands into 400-item chunks
+  4. Directly executes script chunks on MikroTik via REST API (POST /rest/execute) without creating disk files!
 """
 
 import argparse
@@ -85,69 +84,50 @@ def deduplicate_subnets_and_ips(items: list[str]) -> list[str]:
     return [str(net) for net in combined]
 
 
-def upload_and_import_rsc_chunks(mt_host: str, auth: tuple[str, str], list_name: str, subnets: list[str], chunk_size: int = 500):
+def sync_via_rest_execute(mt_host: str, auth: tuple[str, str], list_name: str, subnets: list[str], chunk_size: int = 400):
+    """
+    Direct script execution chunks via POST /rest/execute.
+    Does NOT write files to MikroTik disk, avoiding file permission / payload upload errors.
+    """
     base_url = f"https://{mt_host}/rest"
     total_items = len(subnets)
     chunks = [subnets[i:i + chunk_size] for i in range(0, total_items, chunk_size)]
 
-    print(f"📦 Total {total_items} items split into {len(chunks)} chunks ({chunk_size} items per chunk).", flush=True)
+    print(f"⚡ Direct REST API Sync: {total_items} rules in {len(chunks)} execution chunks ({chunk_size} rules/chunk).", flush=True)
 
+    success_count = 0
     for idx, chunk in enumerate(chunks, 1):
-        file_name = f"suricata_rules_{idx}.rsc"
         lines = []
 
-        # Only first chunk clears old address-list
+        # First chunk clears old address-list
         if idx == 1:
             lines.append(f"/ip firewall address-list remove [find list={list_name}]")
 
         lines.append("/ip firewall address-list")
         for net_str in chunk:
             lines.append(f"add list={list_name} address={net_str} comment=\"ET Rule Subnet\"")
-        lines.append("")
 
-        rsc_text = "\n".join(lines)
+        script_text = "\n".join(lines)
 
-        # 1. Upload chunk
-        print(f"📤 [{idx}/{len(chunks)}] Uploading '{file_name}' ({len(chunk)} rules)...", flush=True)
-        upload_success = False
+        print(f"  [{idx}/{len(chunks)}] Executing chunk {idx} ({len(chunk)} rules)...", flush=True)
         try:
-            r_up = requests.post(f"{base_url}/file", json={"name": file_name, "contents": rsc_text}, auth=auth, verify=False, timeout=(5, 20))
-            if r_up.status_code in (200, 201):
-                upload_success = True
+            r = requests.post(f"{base_url}/execute", json={"script": script_text}, auth=auth, verify=False, timeout=(5, 30))
+            if r.status_code in (200, 201):
+                success_count += len(chunk)
+                print(f"   ✅ Chunk {idx}/{len(chunks)} executed successfully!", flush=True)
             else:
-                r_put = requests.put(f"{base_url}/file/{file_name}", json={"contents": rsc_text}, auth=auth, verify=False, timeout=(5, 20))
-                if r_put.status_code in (200, 201):
-                    upload_success = True
-                else:
-                    print(f"  Warning: upload response {r_put.status_code}: {r_put.text}", flush=True)
+                print(f"   ⚠️ Chunk {idx} execution response: {r.status_code} {r.text}", flush=True)
         except requests.RequestException as e:
-            print(f"  Warning: upload request error for {file_name}: {e}", flush=True)
+            print(f"   ⚠️ Chunk {idx} execution failed: {e}", flush=True)
 
-        # 2. Execute import if upload succeeded
-        if upload_success:
-            print(f"⚡ [{idx}/{len(chunks)}] Importing {file_name} on MikroTik...", flush=True)
-            try:
-                r_imp = requests.post(f"{base_url}/import", json={"file-name": file_name}, auth=auth, verify=False, timeout=(5, 30))
-                if r_imp.status_code in (200, 201):
-                    print(f"  ✅ Chunk {idx} imported successfully!", flush=True)
-                else:
-                    r_exec = requests.post(f"{base_url}/execute", json={"script": f"/import file-name={file_name}"}, auth=auth, verify=False, timeout=(5, 30))
-                    if r_exec.status_code in (200, 201):
-                        print(f"  ✅ Chunk {idx} executed successfully!", flush=True)
-                    else:
-                        print(f"  ⚠️ Chunk {idx} import response: {r_exec.status_code} {r_exec.text}", flush=True)
-            except requests.RequestException as e:
-                print(f"  ⚠️ Chunk {idx} import request failed: {e}", flush=True)
-        else:
-            print(f"  ⚠️ Skipping import for chunk {idx} because upload failed.", flush=True)
-    print(f"\n✅ All {len(chunks)} chunks processed successfully ({total_items} rules total)!", flush=True)
+    print(f"\n✅ Direct REST API Sync complete! {success_count}/{total_items} rules synced to '{list_name}'.", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Sync Suricata malicious subnets to MikroTik via REST API (Option A).")
     parser.add_argument("--subnets-file", default="/opt/alert-bridge/malicious_subnets.txt", help="Path to malicious subnets file")
     parser.add_argument("--list-name", default="suricata-block", help="MikroTik address-list name (default: suricata-block)")
-    parser.add_argument("--chunk-size", type=int, default=500, help="Chunk size for RSC file uploads (default: 500)")
+    parser.add_argument("--chunk-size", type=int, default=400, help="Chunk size for direct script execution (default: 400)")
     args = parser.parse_args()
 
     if requests is None:
@@ -176,7 +156,7 @@ def main():
     print(f"Optimized to {len(optimized_items)} unique subnets/IPs (removed single IPs covered by subnets).", flush=True)
 
     auth = (mt_user, mt_pass)
-    upload_and_import_rsc_chunks(mt_host, auth, args.list_name, optimized_items, chunk_size=args.chunk_size)
+    sync_via_rest_execute(mt_host, auth, args.list_name, optimized_items, chunk_size=args.chunk_size)
 
 
 if __name__ == "__main__":
