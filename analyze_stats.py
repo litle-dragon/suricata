@@ -128,7 +128,17 @@ def main():
     parser = argparse.ArgumentParser(description="Analyze Suricata alert bridge statistics by /24 subnets.")
     parser.add_argument("--state-file", default="/var/log/suricata/alert-bridge-state.json", help="Path to state JSON")
     parser.add_argument("--journal", action="store_true", default=True, help="Parse historical journalctl logs")
-    args = parser.parse_argument() if len(sys.argv) > 1 else parser.parse_args([])
+    parser.add_argument("--per-day", action="store_true", help="Display breakdown per day")
+    parser.add_argument("--sum", action="store_true", help="Display summary aggregated across the entire period")
+    args = parser.parse_args()
+
+    # Default behavior if neither --per-day nor --sum is specified: default to --sum
+    if not args.per_day and not args.sum:
+        show_per_day = False
+        show_sum = True
+    else:
+        show_per_day = args.per_day
+        show_sum = args.sum
 
     days_data = defaultdict(lambda: {"inbound": defaultdict(int), "outbound": defaultdict(int)})
 
@@ -154,13 +164,30 @@ def main():
         print("No statistics found in state file or journalctl.")
         return
 
-    for day in sorted(days_data.keys()):
-        inbound_agg = aggregate_subnet_24(days_data[day]["inbound"])
-        print_table(day, "Inbound", inbound_agg)
+    sorted_days = sorted(days_data.keys())
 
-        outbound_agg = aggregate_subnet_24(days_data[day]["outbound"])
-        print_table(day, "Outbound", outbound_agg)
+    if show_per_day:
+        for day in sorted_days:
+            inbound_agg = aggregate_subnet_24(days_data[day]["inbound"])
+            print_table(day, "Inbound", inbound_agg)
 
+            outbound_agg = aggregate_subnet_24(days_data[day]["outbound"])
+            print_table(day, "Outbound", outbound_agg)
 
-if __name__ == "__main__":
+    if show_sum:
+        total_inbound = defaultdict(int)
+        total_outbound = defaultdict(int)
+        for day in sorted_days:
+            for ip, cnt in days_data[day]["inbound"].items():
+                total_inbound[ip] += cnt
+            for ip, cnt in days_data[day]["outbound"].items():
+                total_outbound[ip] += cnt
+
+        period_str = f"Entire Period ({sorted_days[0]} .. {sorted_days[-1]})" if len(sorted_days) > 1 else f"Entire Period ({sorted_days[0]})"
+
+        inbound_sum_agg = aggregate_subnet_24(total_inbound)
+        print_table(period_str, "Inbound Summary", inbound_sum_agg)
+
+        outbound_sum_agg = aggregate_subnet_24(total_outbound)
+        print_table(period_str, "Outbound Summary", outbound_sum_agg)
     main()
