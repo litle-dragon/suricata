@@ -108,19 +108,11 @@ def main():
         print(f"State file ({day}) contains no alert entries.")
         return
 
-    if show_per_day:
-        inbound_agg = aggregate_subnet_24(inbound_counts, min_ips=args.min_ips)
-        print_table(f"State File Date: {day}", "Inbound", inbound_agg)
+    inbound_agg = aggregate_subnet_24(inbound_counts, min_ips=args.min_ips)
+    print_table(f"Daily Stats: {day}", "Inbound", inbound_agg)
 
-        outbound_agg = aggregate_subnet_24(outbound_counts, min_ips=args.min_ips)
-        print_table(f"State File Date: {day}", "Outbound", outbound_agg)
-
-    if show_sum:
-        inbound_sum_agg = aggregate_subnet_24(inbound_counts, min_ips=args.min_ips)
-        print_table(f"State File Date: {day}", "Inbound Summary", inbound_sum_agg)
-
-        outbound_sum_agg = aggregate_subnet_24(outbound_counts, min_ips=args.min_ips)
-        print_table(f"State File Date: {day}", "Outbound Summary", outbound_sum_agg)
+    outbound_agg = aggregate_subnet_24(outbound_counts, min_ips=args.min_ips)
+    print_table(f"Daily Stats: {day}", "Outbound", outbound_agg)
 
 
 if __name__ == "__main__":
