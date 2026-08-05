@@ -210,54 +210,57 @@ def main():
     parser = argparse.ArgumentParser(description="Analyze Suricata alert bridge statistics by /24 subnets.")
     parser.add_argument("--state-file", help="Path to state JSON file")
     parser.add_argument("--min-ips", type=int, default=5, help="Minimum unique IPs per subnet to display (default: 5)")
-    parser.add_argument("--sum", "--total", dest="total", action="store_true", help="Analyze all-time cumulative total state file (/var/log/suricata/alert-bridge-total-state.json)")
-    parser.add_argument("--journal", action="store_true", help="Parse historical journalctl logs across all days")
+    parser.add_argument("--sum", "--total", "--journal", dest="sum", action="store_true", help="Read journalctl logs and total state files for complete historical summary")
     parser.add_argument("--sync-mikrotik", "--block-subnets", action="store_true", help="Block subnets with >=10 unique IPs on MikroTik and remove redundant single IPs")
     args = parser.parse_args()
 
     inbound_counts = {}
 
-    if args.journal:
+    if args.sum:
+        # 1. Parse historical journalctl logs
         days_data = parse_journal_logs()
-        if not days_data:
-            print("No statistics found in journalctl.")
-            return
 
-        sorted_days = sorted(days_data.keys())
+        # 2. Merge daily state file
+        daily_state = load_state_file(args.state_file or "/var/log/suricata/alert-bridge-state.json")
+        if daily_state and "date" in daily_state:
+            day = daily_state["date"]
+            for ip, cnt in daily_state.get("inbound_counts", {}).items():
+                days_data[day]["inbound"][ip] = max(days_data[day]["inbound"][ip], cnt)
+
+        # 3. Merge total state file
+        total_state = load_state_file("/var/log/suricata/alert-bridge-total-state.json")
         total_inbound = defaultdict(int)
-        for day in sorted_days:
+
+        for day in sorted(days_data.keys()):
             for ip, cnt in days_data[day]["inbound"].items():
                 total_inbound[ip] += cnt
 
-        period_str = f"Journal History ({sorted_days[0]} .. {sorted_days[-1]})" if len(sorted_days) > 1 else f"Journal History ({sorted_days[0]})"
+        for ip, cnt in total_state.get("inbound_counts", {}).items():
+            total_inbound[ip] = max(total_inbound[ip], cnt)
+
+        if not total_inbound:
+            print("No statistics found in journalctl or state files.")
+            return
+
+        sorted_days = sorted(days_data.keys())
+        period_str = f"Entire Period ({sorted_days[0]} .. {sorted_days[-1]})" if len(sorted_days) > 1 else f"Entire Period ({sorted_days[0]})" if sorted_days else "Entire Period"
+
         inbound_agg = aggregate_subnet_24(total_inbound, min_ips=args.min_ips)
         print_table(period_str, "Inbound Summary", inbound_agg)
         inbound_counts = total_inbound
-
-    elif args.total:
-        state_path = args.state_file or "/var/log/suricata/alert-bridge-total-state.json"
-        state = load_state_file(state_path)
-        if not state:
-            print(f"No statistics found in total state file '{state_path}'.")
-            return
-
-        inbound_counts = state.get("inbound_counts", {})
-        inbound_agg = aggregate_subnet_24(inbound_counts, min_ips=args.min_ips)
-        print_table("All-Time Total State", "Inbound Summary", inbound_agg)
 
     else:
         state_path = args.state_file or "/var/log/suricata/alert-bridge-state.json"
         state = load_state_file(state_path)
         if not state or "date" not in state:
             print(f"No statistics found in daily state file '{state_path}'.")
-            print("Tip: use --sum (or --total) for all-time cumulative summary.")
+            print("Tip: use --sum to read historical logs from journalctl.")
             return
 
         day = state["date"]
         inbound_counts = state.get("inbound_counts", {})
         inbound_agg = aggregate_subnet_24(inbound_counts, min_ips=args.min_ips)
         print_table(f"Daily Stats ({day})", "Inbound", inbound_agg)
-
     if args.sync_mikrotik:
         # Filter subnets with >= 10 unique IPs (or args.min_ips if explicitly passed >= 10)
         sync_min_ips = max(10, args.min_ips)
