@@ -35,13 +35,13 @@ def parse_journal_logs() -> dict[str, dict[str, dict[str, int]]]:
         print(f"Warning: failed to read journalctl: {e}", file=sys.stderr)
         return days_data
 
-    # Match ISO timestamp: 2026-08-04T22:25:23+0300
-    date_pattern = re.compile(r"^(\d{4}-\d{2}-\d{2})T")
-    inbound_pattern = re.compile(r"(inbound-alert|alert).*?\battacker=([0-9a-fA-F:\.]+)")
-    outbound_pattern = re.compile(r"outbound-alert.*?\btarget=([0-9a-fA-F:\.]+)")
+    # Match ISO timestamp (2026-08-04T...) or YYYY-MM-DD anywhere in line
+    date_pattern = re.compile(r"(\d{4}-\d{2}-\d{2})")
+    inbound_pattern = re.compile(r"attacker=([0-9a-fA-F:\.]+)")
+    outbound_pattern = re.compile(r"target=([0-9a-fA-F:\.]+)")
 
     for line in output.splitlines():
-        date_match = date_pattern.match(line)
+        date_match = date_pattern.search(line)
         if not date_match:
             continue
         day = date_match.group(1)
@@ -127,7 +127,8 @@ def print_table(day: str, direction: str, aggregated: list[tuple[str, int, int]]
 def main():
     parser = argparse.ArgumentParser(description="Analyze Suricata alert bridge statistics by /24 subnets.")
     parser.add_argument("--state-file", default="/var/log/suricata/alert-bridge-state.json", help="Path to state JSON")
-    parser.add_argument("--journal", action="store_true", default=True, help="Parse historical journalctl logs")
+    parser.add_argument("--journal", action="store_true", default=True, help="Parse historical journalctl logs (default)")
+    parser.add_argument("--no-journal", dest="journal", action="store_false", help="Skip reading journalctl logs")
     parser.add_argument("--per-day", action="store_true", help="Display breakdown per day")
     parser.add_argument("--sum", action="store_true", help="Display summary aggregated across the entire period")
     args = parser.parse_args()
@@ -155,13 +156,21 @@ def main():
     state = load_state_file(args.state_file)
     if state and "date" in state:
         day = state["date"]
-        for ip, cnt in state.get("inbound_counts", {}).items():
-            days_data[day]["inbound"][ip] = max(days_data[day]["inbound"][ip], cnt)
-        for ip, cnt in state.get("outbound_counts", {}).items():
-            days_data[day]["outbound"][ip] = max(days_data[day]["outbound"][ip], cnt)
+        inbound = state.get("inbound_counts", {})
+        outbound = state.get("outbound_counts", {})
+        if inbound or outbound:
+            for ip, cnt in inbound.items():
+                days_data[day]["inbound"][ip] = max(days_data[day]["inbound"][ip], cnt)
+            for ip, cnt in outbound.items():
+                days_data[day]["outbound"][ip] = max(days_data[day]["outbound"][ip], cnt)
 
-    if not days_data:
-        print("No statistics found in state file or journalctl.")
+    total_records = sum(
+        len(traffic["inbound"]) + len(traffic["outbound"])
+        for traffic in days_data.values()
+    )
+    if total_records == 0:
+        print("No statistics found in state file or journalctl logs.")
+        print("Note: If running as non-root user, try 'sudo python3 analyze_stats.py' to access system logs.")
         return
 
     sorted_days = sorted(days_data.keys())
