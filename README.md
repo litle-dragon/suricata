@@ -791,4 +791,6 @@ sudo tail -f /var/log/suricata/eve.json | jq -c 'select(.event_type=="alert") | 
 |---|---|
 | [`alert-bridge.py`](alert-bridge.py) | Tails `eve.json`, blocks attackers via the MikroTik REST API, notifies via Telegram |
 | [`alert-bridge.service`](alert-bridge.service) | systemd unit for the bridge |
+| [`sync-state-from-journal.py`](sync-state-from-journal.py) | Restores/syncs state file from `journalctl` logs |
+| [`analyze_stats.py`](analyze_stats.py) | Aggregates daily attacker/target statistics grouped by `/24` subnet |
 | [`env.example`](env.example) | Configuration template → copy to `/opt/alert-bridge/env` |
