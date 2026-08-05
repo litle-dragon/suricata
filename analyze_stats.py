@@ -5,6 +5,7 @@ Modes:
   - Default: analyzes current day state file (/var/log/suricata/alert-bridge-state.json)
   - With --sum / --total: analyzes all-time cumulative state file (/var/log/suricata/alert-bridge-total-state.json)
   - With --journal: parses historical journalctl logs
+  - With --sync-mikrotik: blocks subnets with >=10 unique IPs on MikroTik and removes redundant single IPs
 """
 
 import argparse
@@ -15,6 +16,24 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
+
+try:
+    import requests
+    import urllib3
+    urllib3.disable_warnings()
+except ImportError:
+    requests = None
+
+
+def load_env():
+    env_path = "/opt/alert-bridge/env"
+    if os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
 
 
 def parse_journal_logs() -> dict[str, dict[str, dict[str, int]]]:
@@ -108,13 +127,95 @@ def print_table(title: str, direction: str, aggregated: list[tuple[str, int, int
     print("=" * 65)
 
 
+def sync_subnets_to_mikrotik(subnets_to_block: list[tuple[str, int, int]]):
+    if requests is None:
+        print("\nError: 'requests' library not installed. Install with: sudo apt install python3-requests", file=sys.stderr)
+        return
+    mt_host = os.environ.get("MT_HOST", "")
+    mt_user = os.environ.get("MT_USER", "")
+    mt_pass = os.environ.get("MT_PASS", "")
+    block_list = os.environ.get("BLOCK_LIST", "suricata-block")
+
+    if not mt_host or not mt_user or not mt_pass:
+        print("\nError: MikroTik credentials (MT_HOST, MT_USER, MT_PASS) missing in environment or /opt/alert-bridge/env.", file=sys.stderr)
+        return
+
+    if not subnets_to_block:
+        print("\nNo subnets matched the threshold (>= 10 unique IPs) to sync to MikroTik.")
+        return
+
+    print(f"\n🔄 Syncing {len(subnets_to_block)} subnets to MikroTik list '{block_list}'...")
+
+    for subnet_str, unique_cnt, total_alerts in subnets_to_block:
+        try:
+            net = ipaddress.ip_network(subnet_str, strict=False)
+            family = "ipv6" if net.version == 6 else "ip"
+        except ValueError:
+            family = "ip"
+            net = None
+
+        base_url = f"https://{mt_host}/rest/{family}/firewall/address-list"
+        auth = (mt_user, mt_pass)
+
+        # 1. Query existing address-list entries to remove single IPs covered by subnet
+        try:
+            r_get = requests.get(
+                f"{base_url}?list={block_list}",
+                auth=auth,
+                verify=False,
+                timeout=(5, 10),
+            )
+            if r_get.status_code == 200:
+                entries = r_get.json()
+                if isinstance(entries, list):
+                    for entry in entries:
+                        addr = entry.get("address", "")
+                        entry_id = entry.get(".id")
+                        if not entry_id or not addr:
+                            continue
+                        try:
+                            addr_obj = ipaddress.ip_address(addr)
+                            if net and addr_obj in net:
+                                print(f"  🗑️ Removing redundant single IP {addr} (covered by subnet {subnet_str})...", flush=True)
+                                requests.delete(f"{base_url}/{entry_id}", auth=auth, verify=False, timeout=(5, 10))
+                        except ValueError:
+                            if addr == subnet_str and (entry.get("timeout") or entry.get("dynamic") == "true"):
+                                requests.delete(f"{base_url}/{entry_id}", auth=auth, verify=False, timeout=(5, 10))
+        except requests.RequestException as e:
+            print(f"  Warning: failed to query MikroTik entries for {subnet_str}: {e}", file=sys.stderr)
+
+        # 2. Add permanent subnet block
+        body = {
+            "list": block_list,
+            "address": subnet_str,
+            "comment": f"PERMANENT SUBNET ({unique_cnt} IPs, {total_alerts} hits)"[:60],
+        }
+        try:
+            r_put = requests.put(
+                base_url,
+                json=body,
+                auth=auth,
+                verify=False,
+                timeout=(5, 15),
+            )
+            if r_put.status_code in (200, 201) or "already" in r_put.text:
+                print(f"  🔒 Blocked subnet {subnet_str} on MikroTik ({unique_cnt} IPs, {total_alerts} hits)", flush=True)
+            else:
+                print(f"  ⚠️ Failed to block subnet {subnet_str}: {r_put.status_code} {r_put.text}", flush=True)
+        except requests.RequestException as e:
+            print(f"  ⚠️ Exception blocking subnet {subnet_str}: {e}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze Suricata alert bridge statistics by /24 subnets.")
     parser.add_argument("--state-file", help="Path to state JSON file")
     parser.add_argument("--min-ips", type=int, default=5, help="Minimum unique IPs per subnet to display (default: 5)")
     parser.add_argument("--sum", "--total", dest="total", action="store_true", help="Analyze all-time cumulative total state file (/var/log/suricata/alert-bridge-total-state.json)")
     parser.add_argument("--journal", action="store_true", help="Parse historical journalctl logs across all days")
+    parser.add_argument("--sync-mikrotik", "--block-subnets", action="store_true", help="Block subnets with >=10 unique IPs on MikroTik and remove redundant single IPs")
     args = parser.parse_args()
+
+    inbound_counts = {}
 
     if args.journal:
         days_data = parse_journal_logs()
@@ -124,20 +225,14 @@ def main():
 
         sorted_days = sorted(days_data.keys())
         total_inbound = defaultdict(int)
-        total_outbound = defaultdict(int)
         for day in sorted_days:
             for ip, cnt in days_data[day]["inbound"].items():
                 total_inbound[ip] += cnt
-            for ip, cnt in days_data[day]["outbound"].items():
-                total_outbound[ip] += cnt
 
         period_str = f"Journal History ({sorted_days[0]} .. {sorted_days[-1]})" if len(sorted_days) > 1 else f"Journal History ({sorted_days[0]})"
-
         inbound_agg = aggregate_subnet_24(total_inbound, min_ips=args.min_ips)
         print_table(period_str, "Inbound Summary", inbound_agg)
-
-        outbound_agg = aggregate_subnet_24(total_outbound, min_ips=args.min_ips)
-        print_table(period_str, "Outbound Summary", outbound_agg)
+        inbound_counts = total_inbound
 
     elif args.total:
         state_path = args.state_file or "/var/log/suricata/alert-bridge-total-state.json"
@@ -147,16 +242,10 @@ def main():
             return
 
         inbound_counts = state.get("inbound_counts", {})
-        outbound_counts = state.get("outbound_counts", {})
-
         inbound_agg = aggregate_subnet_24(inbound_counts, min_ips=args.min_ips)
         print_table("All-Time Total State", "Inbound Summary", inbound_agg)
 
-        outbound_agg = aggregate_subnet_24(outbound_counts, min_ips=args.min_ips)
-        print_table("All-Time Total State", "Outbound Summary", outbound_agg)
-
     else:
-        # Default: Daily state file
         state_path = args.state_file or "/var/log/suricata/alert-bridge-state.json"
         state = load_state_file(state_path)
         if not state or "date" not in state:
@@ -166,13 +255,14 @@ def main():
 
         day = state["date"]
         inbound_counts = state.get("inbound_counts", {})
-        outbound_counts = state.get("outbound_counts", {})
-
         inbound_agg = aggregate_subnet_24(inbound_counts, min_ips=args.min_ips)
         print_table(f"Daily Stats ({day})", "Inbound", inbound_agg)
 
-        outbound_agg = aggregate_subnet_24(outbound_counts, min_ips=args.min_ips)
-        print_table(f"Daily Stats ({day})", "Outbound", outbound_agg)
+    if args.sync_mikrotik:
+        # Filter subnets with >= 10 unique IPs (or args.min_ips if explicitly passed >= 10)
+        sync_min_ips = max(10, args.min_ips)
+        subnets_to_sync = aggregate_subnet_24(inbound_counts, min_ips=sync_min_ips)
+        sync_subnets_to_mikrotik(subnets_to_sync)
 
 
 if __name__ == "__main__":
