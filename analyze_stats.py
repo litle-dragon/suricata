@@ -24,9 +24,9 @@ def load_state_file(path: str) -> dict:
     return {}
 
 
-def aggregate_subnet_24(ip_counts: dict[str, int]) -> list[tuple[str, int, int]]:
+def aggregate_subnet_24(ip_counts: dict[str, int], min_ips: int = 5) -> list[tuple[str, int, int]]:
     """
-    Groups IP counts by /24 subnet.
+    Groups IP counts by /24 subnet, filtering subnets with < min_ips unique IPs.
     Returns sorted list of tuples: (subnet_24_str, unique_ip_count, total_alerts)
     """
     subnets = defaultdict(lambda: {"ips": set(), "total_alerts": 0})
@@ -49,7 +49,9 @@ def aggregate_subnet_24(ip_counts: dict[str, int]) -> list[tuple[str, int, int]]
 
     res = []
     for net_str, info in subnets.items():
-        res.append((net_str, len(info["ips"]), info["total_alerts"]))
+        unique_cnt = len(info["ips"])
+        if unique_cnt >= min_ips:
+            res.append((net_str, unique_cnt, info["total_alerts"]))
 
     # Sort by total_alerts descending, then unique IPs descending
     res.sort(key=lambda x: (x[2], x[1]), reverse=True)
@@ -80,6 +82,7 @@ def print_table(day: str, direction: str, aggregated: list[tuple[str, int, int]]
 def main():
     parser = argparse.ArgumentParser(description="Analyze Suricata alert bridge statistics by /24 subnets from state JSON.")
     parser.add_argument("--state-file", default="/var/log/suricata/alert-bridge-state.json", help="Path to state JSON")
+    parser.add_argument("--min-ips", type=int, default=5, help="Minimum unique IPs per subnet to display (default: 5)")
     parser.add_argument("--per-day", action="store_true", help="Display breakdown per day")
     parser.add_argument("--sum", action="store_true", help="Display summary aggregated across the entire period")
     args = parser.parse_args()
@@ -106,18 +109,18 @@ def main():
         return
 
     if show_per_day:
-        inbound_agg = aggregate_subnet_24(inbound_counts)
-        print_table(day, "Inbound", inbound_agg)
+        inbound_agg = aggregate_subnet_24(inbound_counts, min_ips=args.min_ips)
+        print_table(f"State File Date: {day}", "Inbound", inbound_agg)
 
-        outbound_agg = aggregate_subnet_24(outbound_counts)
-        print_table(day, "Outbound", outbound_agg)
+        outbound_agg = aggregate_subnet_24(outbound_counts, min_ips=args.min_ips)
+        print_table(f"State File Date: {day}", "Outbound", outbound_agg)
 
     if show_sum:
-        inbound_sum_agg = aggregate_subnet_24(inbound_counts)
-        print_table(f"State Summary ({day})", "Inbound Summary", inbound_sum_agg)
+        inbound_sum_agg = aggregate_subnet_24(inbound_counts, min_ips=args.min_ips)
+        print_table(f"State File Date: {day}", "Inbound Summary", inbound_sum_agg)
 
-        outbound_sum_agg = aggregate_subnet_24(outbound_counts)
-        print_table(f"State Summary ({day})", "Outbound Summary", outbound_sum_agg)
+        outbound_sum_agg = aggregate_subnet_24(outbound_counts, min_ips=args.min_ips)
+        print_table(f"State File Date: {day}", "Outbound Summary", outbound_sum_agg)
 
 
 if __name__ == "__main__":
