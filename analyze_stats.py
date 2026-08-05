@@ -141,6 +141,7 @@ def sync_subnets_to_mikrotik(subnets_to_block: list[tuple[str, int, int]]):
         return
     load_env()
     mt_host = os.environ.get("MT_HOST", "")
+    mt_user = os.environ.get("MT_USER", "")
     mt_pass = os.environ.get("MT_PASS", "")
     block_list = os.environ.get("BLOCK_LIST", "suricata-block")
     if not mt_host or not mt_user or not mt_pass or "YOUR_" in mt_host or "YOUR_" in mt_pass:
