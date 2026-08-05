@@ -48,7 +48,7 @@ def parse_journal_logs() -> dict[str, dict[str, dict[str, int]]]:
 
         in_match = inbound_pattern.search(line)
         if in_match:
-            ip = in_match.group(2)
+            ip = in_match.group(1)
             days_data[day]["inbound"][ip] += 1
             continue
 
@@ -127,8 +127,7 @@ def print_table(day: str, direction: str, aggregated: list[tuple[str, int, int]]
 def main():
     parser = argparse.ArgumentParser(description="Analyze Suricata alert bridge statistics by /24 subnets.")
     parser.add_argument("--state-file", default="/var/log/suricata/alert-bridge-state.json", help="Path to state JSON")
-    parser.add_argument("--journal", action="store_true", default=True, help="Parse historical journalctl logs (default)")
-    parser.add_argument("--no-journal", dest="journal", action="store_false", help="Skip reading journalctl logs")
+    parser.add_argument("--journal", action="store_true", default=False, help="Include historical journalctl logs (default: state file only)")
     parser.add_argument("--per-day", action="store_true", help="Display breakdown per day")
     parser.add_argument("--sum", action="store_true", help="Display summary aggregated across the entire period")
     args = parser.parse_args()
