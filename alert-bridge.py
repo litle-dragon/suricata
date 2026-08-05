@@ -4,12 +4,13 @@
 Follows eve.json like `tail -F` (survives logrotate), and for every alert
 with severity <= MAX_SEVERITY:
   - Classifies flow into Inbound (external attacker -> LAN) or Outbound (LAN -> external target)
-  - Tracks daily attempt history per IP for both directions with persistent state (/var/log/suricata/alert-bridge-state.json)
-  - Inbound traffic: 1h block for hits 1-2. Escalates to PERMANENT block on MikroTik at hit >= 3
-    with a priority Telegram alert.
-  - Outbound traffic: always 1h temporary block on MikroTik. Every 6 hours, sends a Telegram
-    summary digest listing all outbound target IPs with >= 3 hits today.
-  - Rate-limits Telegram messages (COOLDOWN) except for permanent block escalation.
+  - Tracks attempt history per IP and per /24 subnet in 2 state files:
+      1. /var/log/suricata/alert-bridge-state.json (Daily state, resets at midnight)
+      2. /var/log/suricata/alert-bridge-total-state.json (Cumulative total state across all days)
+  - Inbound traffic: 1h block for hits 1-2. Escalates to PERMANENT block on MikroTik at hit >= 3.
+  - Subnet aggregation: when a /24 subnet reaches 10 unique attacker IPs today, blocks the entire /24 subnet permanently on MikroTik.
+  - Outbound traffic: 1h temporary block on MikroTik.
+  - Telegram notifications: temporarily disabled per user request.
 """
 
 import ipaddress
@@ -24,11 +25,13 @@ urllib3.disable_warnings()  # self-signed cert on the router's www-ssl
 
 EVE_LOG = "/var/log/suricata/eve.json"
 STATE_FILE = "/var/log/suricata/alert-bridge-state.json"
+TOTAL_STATE_FILE = "/var/log/suricata/alert-bridge-total-state.json"
 MAX_SEVERITY = 2          # 1=high, 2=medium; 3=informational is ignored
 BLOCK_TIMEOUT = os.environ.get("BLOCK_TIMEOUT", "1h")  # temporary block duration
 COOLDOWN = 300            # seconds before re-alerting same ip+signature
 BLOCK_LIST = "suricata-block"
 PERMANENT_THRESHOLD = 3   # Inbound attempts today before permanent block
+SUBNET_THRESHOLD = 10     # Unique IPs in /24 subnet today before blocking whole /24
 OUTBOUND_SUMMARY_INTERVAL = 6 * 3600  # 6 hours in seconds
 
 # Reputation-list hits: real enough to block, too common to page about
@@ -60,9 +63,6 @@ def _parse_cidrs(val: str) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network
 
 _wan_nets = _parse_cidrs(WAN_IP) + _parse_cidrs(WAN_IPV6_PREFIX)
 
-# Never block these, no matter what Suricata says: RFC1918 / CGNAT / loopback
-# and well-known public DNS resolvers. Own public IPs come from WAN_IP /
-# WAN_IPV6_PREFIX in the env so this file stays deployment-agnostic.
 WHITELIST = [
     ipaddress.ip_network(n)
     for n in (
@@ -81,60 +81,160 @@ WHITELIST = [
     )
 ] + _wan_nets
 
-# Match suricata.yaml HOME_NET — used to decide direction of traffic.
 HOME_NETS = [
     ipaddress.ip_network(n)
     for n in ("192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "100.64.0.0/10")
 ] + _wan_nets
 
 _recent: dict[str, float] = {}
+
+# Journal 1: Daily state (resets at midnight)
 _daily_inbound_counts: dict[str, int] = {}
 _daily_outbound_counts: dict[str, int] = {}
+_daily_inbound_subnets: dict[str, dict] = {}   # { "subnet": {"unique_ips": [...], "total_alerts": int} }
+_daily_outbound_subnets: dict[str, dict] = {}
+
+# Journal 2: Total state (persistent forever)
+_total_inbound_counts: dict[str, int] = {}
+_total_outbound_counts: dict[str, int] = {}
+_total_inbound_subnets: dict[str, dict] = {}
+_total_outbound_subnets: dict[str, dict] = {}
+
 _quiet_blocks = 0
 _digest_day = time.strftime("%Y-%m-%d")
 _last_outbound_summary_time = time.time()
 
 
 def load_state() -> None:
-    """Load persistent counters and state from JSON file if available."""
-    global _digest_day, _quiet_blocks, _daily_inbound_counts, _daily_outbound_counts, _last_outbound_summary_time
+    """Load daily state and total persistent state from JSON files if available."""
+    global _digest_day, _quiet_blocks, _daily_inbound_counts, _daily_outbound_counts, _daily_inbound_subnets, _daily_outbound_subnets
+    global _total_inbound_counts, _total_outbound_counts, _total_inbound_subnets, _total_outbound_subnets, _last_outbound_summary_time
     today = time.strftime("%Y-%m-%d")
-    if not os.path.exists(STATE_FILE):
-        return
-    try:
-        with open(STATE_FILE, "r") as f:
-            data = json.load(f)
-        saved_date = data.get("date", "")
-        if saved_date == today:
-            _digest_day = saved_date
-            _quiet_blocks = data.get("quiet_blocks", 0)
-            _daily_inbound_counts = data.get("inbound_counts", {})
-            _daily_outbound_counts = data.get("outbound_counts", {})
-            _last_outbound_summary_time = data.get("last_outbound_summary_time", time.time())
-            print(f"loaded state for {today}: {_quiet_blocks} quiet blocks, "
-                  f"{len(_daily_inbound_counts)} inbound IPs, {len(_daily_outbound_counts)} outbound IPs", flush=True)
-        else:
-            print(f"state file is from previous day ({saved_date}), starting fresh for {today}", flush=True)
-    except Exception as e:
-        print(f"warning: failed to load state file: {e}", flush=True)
+
+    # 1. Load Daily State
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+            saved_date = data.get("date", "")
+            if saved_date == today:
+                _digest_day = saved_date
+                _quiet_blocks = data.get("quiet_blocks", 0)
+                _daily_inbound_counts = data.get("inbound_counts", {})
+                _daily_outbound_counts = data.get("outbound_counts", {})
+                _daily_inbound_subnets = data.get("inbound_subnets", {})
+                _daily_outbound_subnets = data.get("outbound_subnets", {})
+                _last_outbound_summary_time = data.get("last_outbound_summary_time", time.time())
+                print(f"loaded daily state for {today}: {_quiet_blocks} quiet blocks, "
+                      f"{len(_daily_inbound_counts)} inbound IPs, {len(_daily_inbound_subnets)} inbound subnets", flush=True)
+            else:
+                print(f"daily state file is from previous day ({saved_date}), starting fresh for {today}", flush=True)
+        except Exception as e:
+            print(f"warning: failed to load daily state file: {e}", flush=True)
+
+    # 2. Load Total State
+    if os.path.exists(TOTAL_STATE_FILE):
+        try:
+            with open(TOTAL_STATE_FILE, "r") as f:
+                t_data = json.load(f)
+            _total_inbound_counts = t_data.get("inbound_counts", {})
+            _total_outbound_counts = t_data.get("outbound_counts", {})
+            _total_inbound_subnets = t_data.get("inbound_subnets", {})
+            _total_outbound_subnets = t_data.get("outbound_subnets", {})
+            print(f"loaded total state: {len(_total_inbound_counts)} total inbound IPs, "
+                  f"{len(_total_inbound_subnets)} total inbound subnets", flush=True)
+        except Exception as e:
+            print(f"warning: failed to load total state file: {e}", flush=True)
 
 
 def save_state() -> None:
-    """Atomically save current state to JSON file."""
-    state = {
+    """Atomically save current daily and total states to JSON files."""
+    # 1. Save Daily State
+    daily_state = {
         "date": _digest_day,
         "quiet_blocks": _quiet_blocks,
         "inbound_counts": _daily_inbound_counts,
         "outbound_counts": _daily_outbound_counts,
+        "inbound_subnets": _daily_inbound_subnets,
+        "outbound_subnets": _daily_outbound_subnets,
         "last_outbound_summary_time": _last_outbound_summary_time,
     }
-    tmp_path = STATE_FILE + ".tmp"
+    tmp_daily = STATE_FILE + ".tmp"
     try:
-        with open(tmp_path, "w") as f:
-            json.dump(state, f)
-        os.replace(tmp_path, STATE_FILE)
+        with open(tmp_daily, "w") as f:
+            json.dump(daily_state, f)
+        os.replace(tmp_daily, STATE_FILE)
     except Exception as e:
-        print(f"warning: failed to save state file: {e}", flush=True)
+        print(f"warning: failed to save daily state file: {e}", flush=True)
+
+    # 2. Save Total State
+    total_state = {
+        "inbound_counts": _total_inbound_counts,
+        "outbound_counts": _total_outbound_counts,
+        "inbound_subnets": _total_inbound_subnets,
+        "outbound_subnets": _total_outbound_subnets,
+    }
+    tmp_total = TOTAL_STATE_FILE + ".tmp"
+    try:
+        with open(tmp_total, "w") as f:
+            json.dump(total_state, f)
+        os.replace(tmp_total, TOTAL_STATE_FILE)
+    except Exception as e:
+        print(f"warning: failed to save total state file: {e}", flush=True)
+
+
+def get_subnet(ip: str) -> str:
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        prefix = 24 if ip_obj.version == 4 else 64
+        return str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))
+    except ValueError:
+        return ip
+
+
+def record_hit(direction: str, ip: str) -> tuple[int, str, int]:
+    """
+    Records a hit for IP and its subnet in both daily and total state.
+    Returns: (ip_daily_count, subnet_str, subnet_daily_unique_count)
+    """
+    subnet_str = get_subnet(ip)
+
+    if direction == "inbound":
+        _daily_inbound_counts[ip] = _daily_inbound_counts.get(ip, 0) + 1
+        ip_daily_count = _daily_inbound_counts[ip]
+
+        s_daily = _daily_inbound_subnets.setdefault(subnet_str, {"unique_ips": [], "total_alerts": 0})
+        if ip not in s_daily["unique_ips"]:
+            s_daily["unique_ips"].append(ip)
+        s_daily["total_alerts"] += 1
+        subnet_daily_unique_cnt = len(s_daily["unique_ips"])
+
+        _total_inbound_counts[ip] = _total_inbound_counts.get(ip, 0) + 1
+
+        s_total = _total_inbound_subnets.setdefault(subnet_str, {"unique_ips": [], "total_alerts": 0})
+        if ip not in s_total["unique_ips"]:
+            s_total["unique_ips"].append(ip)
+        s_total["total_alerts"] += 1
+
+        return ip_daily_count, subnet_str, subnet_daily_unique_cnt
+    else:
+        _daily_outbound_counts[ip] = _daily_outbound_counts.get(ip, 0) + 1
+        ip_daily_count = _daily_outbound_counts[ip]
+
+        s_daily = _daily_outbound_subnets.setdefault(subnet_str, {"unique_ips": [], "total_alerts": 0})
+        if ip not in s_daily["unique_ips"]:
+            s_daily["unique_ips"].append(ip)
+        s_daily["total_alerts"] += 1
+        subnet_daily_unique_cnt = len(s_daily["unique_ips"])
+
+        _total_outbound_counts[ip] = _total_outbound_counts.get(ip, 0) + 1
+
+        s_total = _total_outbound_subnets.setdefault(subnet_str, {"unique_ips": [], "total_alerts": 0})
+        if ip not in s_total["unique_ips"]:
+            s_total["unique_ips"].append(ip)
+        s_total["total_alerts"] += 1
+
+        return ip_daily_count, subnet_str, subnet_daily_unique_cnt
 
 
 def whitelisted(ip: str) -> bool:
@@ -146,10 +246,6 @@ def whitelisted(ip: str) -> bool:
 
 
 def classify_flow(ev: dict) -> tuple[str, str, str]:
-    """
-    Returns (direction, target_ip, internal_ip)
-    direction: 'inbound' or 'outbound'
-    """
     src = ev.get("src_ip", "")
     dest = ev.get("dest_ip", "")
 
@@ -168,7 +264,6 @@ def classify_flow(ev: dict) -> tuple[str, str, str]:
     elif src_home and not dest_home:
         return "outbound", dest, src
     else:
-        # Fallback: if src is not home, treat as inbound
         return ("inbound", src, dest) if not src_home else ("outbound", dest, src)
 
 
@@ -177,42 +272,31 @@ def cooled_down(key: str) -> bool:
     if now - _recent.get(key, 0) < COOLDOWN:
         return False
     _recent[key] = now
-    # keep the dedup table from growing forever
     for k in [k for k, t in _recent.items() if now - t > COOLDOWN * 4]:
         del _recent[k]
     return True
 
 
 def telegram_send(text: str) -> None:
-    if not TG_TOKEN or not TG_CHAT:
-        return  # Telegram not configured yet — alerts still logged + blocked
-    payload = {"chat_id": TG_CHAT, "text": text}
-    if TG_THREAD_ID:
-        try:
-            payload["message_thread_id"] = int(TG_THREAD_ID)
-        except ValueError:
-            pass
+    # Temporarily disabled per user request
+    return
+
+
+def mikrotik_block(ip_or_subnet: str, signature: str, permanent: bool = False) -> bool:
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json=payload,
-            timeout=10,
-        )
-    except requests.RequestException as e:
-        print(f"telegram failed: {e}", flush=True)
+        net = ipaddress.ip_network(ip_or_subnet, strict=False)
+        family = "ipv6" if net.version == 6 else "ip"
+    except ValueError:
+        family = "ip"
 
-
-def mikrotik_block(ip: str, signature: str, permanent: bool = False) -> bool:
-    family = "ipv6" if ipaddress.ip_address(ip).version == 6 else "ip"
-    comment_prefix = "PERMANENT (3+ hits): " if permanent else ""
+    comment_prefix = "PERMANENT: " if permanent else ""
     base_url = f"https://{MT_HOST}/rest/{family}/firewall/address-list"
     auth = (MT_USER, MT_PASS)
 
     if permanent:
         try:
-            # Check if entry currently exists and is temporary
             r_get = requests.get(
-                f"{base_url}?list={BLOCK_LIST}&address={ip}",
+                f"{base_url}?list={BLOCK_LIST}&address={ip_or_subnet}",
                 auth=auth,
                 verify=False,
                 timeout=(5, 10),
@@ -231,11 +315,11 @@ def mikrotik_block(ip: str, signature: str, permanent: bool = False) -> bool:
                                     timeout=(5, 10),
                                 )
         except requests.RequestException as e:
-            print(f"mikrotik lookup/delete failed for {ip}: {e}", flush=True)
+            print(f"mikrotik lookup/delete failed for {ip_or_subnet}: {e}", flush=True)
 
     body = {
         "list": BLOCK_LIST,
-        "address": ip,
+        "address": ip_or_subnet,
         "comment": (comment_prefix + signature)[:60],
     }
     if not permanent:
@@ -247,52 +331,37 @@ def mikrotik_block(ip: str, signature: str, permanent: bool = False) -> bool:
             json=body,
             auth=auth,
             verify=False,
-            timeout=(5, 15),  # 5s connect, 15s read timeout
+            timeout=(5, 15),
         )
-        # 400 "already have such entry" is fine — it's already blocked
         return r.status_code in (200, 201) or "already" in r.text
     except requests.RequestException as e:
-        print(f"mikrotik block failed for {ip}: {e}", flush=True)
+        print(f"mikrotik block failed for {ip_or_subnet}: {e}", flush=True)
         return False
 
 
 def check_periodic_tasks() -> None:
-    """Checks for midnight day-rollover and 6-hour outbound summary digest."""
-    global _quiet_blocks, _digest_day, _daily_inbound_counts, _daily_outbound_counts, _last_outbound_summary_time
+    global _quiet_blocks, _digest_day, _daily_inbound_counts, _daily_outbound_counts, _daily_inbound_subnets, _daily_outbound_subnets, _last_outbound_summary_time
     now = time.time()
     today = time.strftime("%Y-%m-%d")
 
     # 1. Day Rollover at Midnight
     if today != _digest_day:
-        if _quiet_blocks:
-            telegram_send(f"🌦 {_digest_day}: silently blocked {_quiet_blocks} "
-                          "reputation-listed IPs (ET DROP/CINS/TOR)")
         _digest_day = today
         _quiet_blocks = 0
         _daily_inbound_counts.clear()
         _daily_outbound_counts.clear()
+        _daily_inbound_subnets.clear()
+        _daily_outbound_subnets.clear()
         _last_outbound_summary_time = now
         save_state()
 
     # 2. 6-Hour Outbound Summary Digest
     if now - _last_outbound_summary_time >= OUTBOUND_SUMMARY_INTERVAL:
         _last_outbound_summary_time = now
-        frequent_outbound = {
-            ip: count for ip, count in _daily_outbound_counts.items() if count >= 3
-        }
-        if frequent_outbound:
-            lines = [f"• `{ip}` — {count} hits" for ip, count in sorted(frequent_outbound.items(), key=lambda x: x[1], reverse=True)]
-            text = (
-                "📊 Outbound Summary (6h Digest) 📤\n"
-                f"Targets with >= 3 hits today ({today}):\n"
-                + "\n".join(lines)
-            )
-            telegram_send(text)
         save_state()
 
 
 def follow(path: str):
-    """tail -F: follow the file across logrotate, truncation, and re-create."""
     f = None
     inode = None
     pos = None
@@ -304,7 +373,7 @@ def follow(path: str):
                     f.close()
                 f = open(path, "r")
                 inode = st.st_ino
-                f.seek(0, os.SEEK_END)  # only new events
+                f.seek(0, os.SEEK_END)
                 pos = f.tell()
             line = f.readline()
             if line:
@@ -342,12 +411,14 @@ def main() -> None:
         quiet = sig.startswith(QUIET_PREFIXES)
 
         if direction == "inbound":
-            _daily_inbound_counts[target_ip] = _daily_inbound_counts.get(target_ip, 0) + 1
-            attempts = _daily_inbound_counts[target_ip]
+            attempts, subnet_str, subnet_unique_cnt = record_hit("inbound", target_ip)
+
+            # Subnet Aggregation Threshold: block entire /24 if 10 unique IPs reached today
+            if subnet_unique_cnt == SUBNET_THRESHOLD:
+                blocked_sub = mikrotik_block(subnet_str, f"SUBNET BLOCK (10+ IPs): {sig}", permanent=True)
+                print(f"subnet-block {sig} subnet={subnet_str} unique_ips={subnet_unique_cnt} permanent=True blocked={blocked_sub}", flush=True)
 
             if attempts > PERMANENT_THRESHOLD:
-                # Already permanently blocked on MikroTik on the 3rd attempt.
-                # Ignore subsequent mirrored packets to prevent Telegram spam.
                 save_state()
                 continue
 
@@ -359,17 +430,7 @@ def main() -> None:
 
             blocked = mikrotik_block(target_ip, sig, permanent=permanent)
 
-            if permanent:
-                # Sent EXACTLY ONCE on the 3rd attempt when escalating to PERMANENT block
-                telegram_send(
-                    "🔒 PERMANENT BLOCK (Inbound 📥)\n"
-                    f"Attacker IP {target_ip} reached {attempts} attack attempts today!\n"
-                    f"Signature: {sig}\n"
-                    f"{ev.get('src_ip')}:{ev.get('src_port', '')} → {ev.get('dest_ip')}:{ev.get('dest_port', '')}\n"
-                    f"Severity {alert.get('severity')} · "
-                    + (f"🔒 PERMANENTLY BLOCKED on MikroTik" if blocked else "⚠️ Permanent block FAILED")
-                )
-            elif quiet:
+            if quiet:
                 _quiet_blocks += 1
             else:
                 telegram_send(
@@ -384,8 +445,7 @@ def main() -> None:
 
         else:
             # Outbound traffic (LAN -> WAN)
-            _daily_outbound_counts[target_ip] = _daily_outbound_counts.get(target_ip, 0) + 1
-            attempts = _daily_outbound_counts[target_ip]
+            attempts, subnet_str, subnet_unique_cnt = record_hit("outbound", target_ip)
 
             if not cooled_down(f"outbound|{target_ip}|{alert.get('signature_id')}"):
                 save_state()
