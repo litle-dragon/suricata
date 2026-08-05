@@ -1,64 +1,15 @@
 #!/usr/bin/env python3
-"""Analyze Suricata alert bridge statistics by /24 subnets per day.
+"""Analyze Suricata alert bridge statistics by /24 subnets from state JSON file.
 
-Sources:
-  1. /var/log/suricata/alert-bridge-state.json (current day state)
-  2. journalctl -u alert-bridge (historical logs across multiple days)
+Reads /var/log/suricata/alert-bridge-state.json and aggregates IP counts by /24 subnets.
 """
 
 import argparse
 import ipaddress
 import json
 import os
-import re
-import subprocess
 import sys
 from collections import defaultdict
-
-
-def parse_journal_logs() -> dict[str, dict[str, dict[str, int]]]:
-    """
-    Parses journalctl output into structure:
-    {
-       "YYYY-MM-DD": {
-           "inbound": {"ip": count, ...},
-           "outbound": {"ip": count, ...}
-       }
-    }
-    """
-    days_data = defaultdict(lambda: {"inbound": defaultdict(int), "outbound": defaultdict(int)})
-
-    try:
-        cmd = ["journalctl", "-u", "alert-bridge", "--output=short-iso", "--no-pager"]
-        output = subprocess.check_output(cmd, text=True, errors="replace")
-    except Exception as e:
-        print(f"Warning: failed to read journalctl: {e}", file=sys.stderr)
-        return days_data
-
-    # Match ISO timestamp (2026-08-04T...) or YYYY-MM-DD anywhere in line
-    date_pattern = re.compile(r"(\d{4}-\d{2}-\d{2})")
-    inbound_pattern = re.compile(r"attacker=([0-9a-fA-F:\.]+)")
-    outbound_pattern = re.compile(r"target=([0-9a-fA-F:\.]+)")
-
-    for line in output.splitlines():
-        date_match = date_pattern.search(line)
-        if not date_match:
-            continue
-        day = date_match.group(1)
-
-        in_match = inbound_pattern.search(line)
-        if in_match:
-            ip = in_match.group(1)
-            days_data[day]["inbound"][ip] += 1
-            continue
-
-        out_match = outbound_pattern.search(line)
-        if out_match:
-            ip = out_match.group(1)
-            days_data[day]["outbound"][ip] += 1
-            continue
-
-    return days_data
 
 
 def load_state_file(path: str) -> dict:
@@ -68,6 +19,8 @@ def load_state_file(path: str) -> dict:
                 return json.load(f)
         except Exception as e:
             print(f"Warning: failed to load {path}: {e}", file=sys.stderr)
+    else:
+        print(f"Error: state file '{path}' not found.", file=sys.stderr)
     return {}
 
 
@@ -125,9 +78,8 @@ def print_table(day: str, direction: str, aggregated: list[tuple[str, int, int]]
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze Suricata alert bridge statistics by /24 subnets.")
+    parser = argparse.ArgumentParser(description="Analyze Suricata alert bridge statistics by /24 subnets from state JSON.")
     parser.add_argument("--state-file", default="/var/log/suricata/alert-bridge-state.json", help="Path to state JSON")
-    parser.add_argument("--journal", action="store_true", default=False, help="Include historical journalctl logs (default: state file only)")
     parser.add_argument("--per-day", action="store_true", help="Display breakdown per day")
     parser.add_argument("--sum", action="store_true", help="Display summary aggregated across the entire period")
     args = parser.parse_args()
@@ -140,64 +92,32 @@ def main():
         show_per_day = args.per_day
         show_sum = args.sum
 
-    days_data = defaultdict(lambda: {"inbound": defaultdict(int), "outbound": defaultdict(int)})
-
-    # Load from journalctl if available
-    if args.journal:
-        j_data = parse_journal_logs()
-        for day, traffic in j_data.items():
-            for ip, cnt in traffic["inbound"].items():
-                days_data[day]["inbound"][ip] += cnt
-            for ip, cnt in traffic["outbound"].items():
-                days_data[day]["outbound"][ip] += cnt
-
-    # Merge current state file if available
     state = load_state_file(args.state_file)
-    if state and "date" in state:
-        day = state["date"]
-        inbound = state.get("inbound_counts", {})
-        outbound = state.get("outbound_counts", {})
-        if inbound or outbound:
-            for ip, cnt in inbound.items():
-                days_data[day]["inbound"][ip] = max(days_data[day]["inbound"][ip], cnt)
-            for ip, cnt in outbound.items():
-                days_data[day]["outbound"][ip] = max(days_data[day]["outbound"][ip], cnt)
-
-    total_records = sum(
-        len(traffic["inbound"]) + len(traffic["outbound"])
-        for traffic in days_data.values()
-    )
-    if total_records == 0:
-        print("No statistics found in state file or journalctl logs.")
-        print("Note: If running as non-root user, try 'sudo python3 analyze_stats.py' to access system logs.")
+    if not state or "date" not in state:
+        print("No statistics found in state file.")
         return
 
-    sorted_days = sorted(days_data.keys())
+    day = state["date"]
+    inbound_counts = state.get("inbound_counts", {})
+    outbound_counts = state.get("outbound_counts", {})
+
+    if not inbound_counts and not outbound_counts:
+        print(f"State file ({day}) contains no alert entries.")
+        return
 
     if show_per_day:
-        for day in sorted_days:
-            inbound_agg = aggregate_subnet_24(days_data[day]["inbound"])
-            print_table(day, "Inbound", inbound_agg)
+        inbound_agg = aggregate_subnet_24(inbound_counts)
+        print_table(day, "Inbound", inbound_agg)
 
-            outbound_agg = aggregate_subnet_24(days_data[day]["outbound"])
-            print_table(day, "Outbound", outbound_agg)
+        outbound_agg = aggregate_subnet_24(outbound_counts)
+        print_table(day, "Outbound", outbound_agg)
 
     if show_sum:
-        total_inbound = defaultdict(int)
-        total_outbound = defaultdict(int)
-        for day in sorted_days:
-            for ip, cnt in days_data[day]["inbound"].items():
-                total_inbound[ip] += cnt
-            for ip, cnt in days_data[day]["outbound"].items():
-                total_outbound[ip] += cnt
+        inbound_sum_agg = aggregate_subnet_24(inbound_counts)
+        print_table(f"State Summary ({day})", "Inbound Summary", inbound_sum_agg)
 
-        period_str = f"Entire Period ({sorted_days[0]} .. {sorted_days[-1]})" if len(sorted_days) > 1 else f"Entire Period ({sorted_days[0]})"
-
-        inbound_sum_agg = aggregate_subnet_24(total_inbound)
-        print_table(period_str, "Inbound Summary", inbound_sum_agg)
-
-        outbound_sum_agg = aggregate_subnet_24(total_outbound)
-        print_table(period_str, "Outbound Summary", outbound_sum_agg)
+        outbound_sum_agg = aggregate_subnet_24(outbound_counts)
+        print_table(f"State Summary ({day})", "Outbound Summary", outbound_sum_agg)
 
 
 if __name__ == "__main__":
