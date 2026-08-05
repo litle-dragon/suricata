@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Sync Suricata malicious subnets/IPs to MikroTik via REST API (Option A: Fast RSC Upload & Import).
+"""Sync Suricata malicious subnets/IPs to MikroTik via REST API (Option A: Fast RSC Upload & Import with Chunking).
 
 Option A:
   1. Reads malicious IPs/subnets from /opt/alert-bridge/malicious_subnets.txt
   2. Deduplicates single IPs covered by larger subnets
-  3. Generates RouterOS script (.rsc)
-  4. Uploads file to MikroTik via REST API (POST /rest/file)
-  5. Executes '/import file-name=suricata_rules.rsc' via REST API (POST /rest/import or /rest/execute)
+  3. Splits large lists into 3000-item chunks to fit RouterOS REST API payload limits
+  4. Uploads chunk files to MikroTik via REST API (POST /rest/file)
+  5. Executes '/import file-name=suricata_rules_X.rsc' via REST API (POST /rest/import or /rest/execute)
 """
 
 import argparse
@@ -85,64 +85,67 @@ def deduplicate_subnets_and_ips(items: list[str]) -> list[str]:
     return [str(net) for net in combined]
 
 
-def generate_rsc_content(subnets: list[str], list_name: str) -> str:
-    lines = [
-        f"# Auto-generated MikroTik import script for Suricata rules subnets",
-        f"/ip firewall address-list remove [find list={list_name}]",
-        f"/ip firewall address-list",
-    ]
-    for net_str in subnets:
-        lines.append(f"add list={list_name} address={net_str} comment=\"ET Rule Subnet\"")
-    lines.append("")
-    return "\n".join(lines)
-
-
-def upload_and_import_rsc(mt_host: str, auth: tuple[str, str], list_name: str, rsc_text: str, file_name: str = "suricata_rules.rsc") -> bool:
+def upload_and_import_rsc_chunks(mt_host: str, auth: tuple[str, str], list_name: str, subnets: list[str], chunk_size: int = 3000):
     base_url = f"https://{mt_host}/rest"
+    total_items = len(subnets)
+    chunks = [subnets[i:i + chunk_size] for i in range(0, total_items, chunk_size)]
 
-    # 1. Upload .rsc file content to MikroTik
-    upload_url = f"{base_url}/file"
-    upload_payload = {
-        "name": file_name,
-        "contents": rsc_text
-    }
-    print(f"📤 Uploading '{file_name}' to MikroTik REST API ({mt_host})...", flush=True)
-    try:
-        r_up = requests.post(upload_url, json=upload_payload, auth=auth, verify=False, timeout=(5, 15))
-        if r_up.status_code not in (200, 201):
-            # Fallback: PUT /rest/file/<file_name>
-            r_up = requests.put(f"{base_url}/file/{file_name}", json={"contents": rsc_text}, auth=auth, verify=False, timeout=(5, 15))
-            if r_up.status_code not in (200, 201):
-                print(f"  Warning: REST API file upload response: {r_up.status_code} {r_up.text}", flush=True)
-    except requests.RequestException as e:
-        print(f"  Warning: REST API upload request failed: {e}", flush=True)
+    print(f"📦 Total {total_items} items split into {len(chunks)} chunks ({chunk_size} items per chunk).", flush=True)
 
-    # 2. Execute /import file-name=suricata_rules.rsc via REST API
-    print(f"⚡ Executing import on MikroTik: /import file-name={file_name} ...", flush=True)
-    try:
-        r_imp = requests.post(f"{base_url}/import", json={"file-name": file_name}, auth=auth, verify=False, timeout=(5, 30))
-        if r_imp.status_code in (200, 201):
-            print(f"✅ Successfully imported into MikroTik address-list '{list_name}'!", flush=True)
-            return True
-        else:
-            # Fallback: try /rest/execute
-            r_exec = requests.post(f"{base_url}/execute", json={"script": f"/import file-name={file_name}"}, auth=auth, verify=False, timeout=(5, 30))
-            if r_exec.status_code in (200, 201):
-                print(f"✅ Successfully executed import script on MikroTik address-list '{list_name}'!", flush=True)
-                return True
+    for idx, chunk in enumerate(chunks, 1):
+        file_name = f"suricata_rules_{idx}.rsc"
+        lines = []
+
+        # Only first chunk clears old address-list
+        if idx == 1:
+            lines.append(f"/ip firewall address-list remove [find list={list_name}]")
+
+        lines.append("/ip firewall address-list")
+        for net_str in chunk:
+            lines.append(f"add list={list_name} address={net_str} comment=\"ET Rule Subnet\"")
+        lines.append("")
+
+        rsc_text = "\n".join(lines)
+
+        # 1. Upload chunk
+        print(f"📤 [{idx}/{len(chunks)}] Uploading '{file_name}' ({len(chunk)} rules)...", flush=True)
+        upload_success = False
+        try:
+            r_up = requests.post(f"{base_url}/file", json={"name": file_name, "contents": rsc_text}, auth=auth, verify=False, timeout=(5, 20))
+            if r_up.status_code in (200, 201):
+                upload_success = True
             else:
-                print(f"⚠️ Import command response: {r_exec.status_code} {r_exec.text}", flush=True)
-                return False
-    except requests.RequestException as e:
-        print(f"⚠️ Import request failed: {e}", flush=True)
-        return False
+                r_put = requests.put(f"{base_url}/file/{file_name}", json={"contents": rsc_text}, auth=auth, verify=False, timeout=(5, 20))
+                if r_put.status_code in (200, 201):
+                    upload_success = True
+                else:
+                    print(f"  Warning: upload response {r_put.status_code}: {r_put.text}", flush=True)
+        except requests.RequestException as e:
+            print(f"  Warning: upload request error for {file_name}: {e}", flush=True)
+
+        # 2. Execute import
+        print(f"⚡ [{idx}/{len(chunks)}] Importing {file_name} on MikroTik...", flush=True)
+        try:
+            r_imp = requests.post(f"{base_url}/import", json={"file-name": file_name}, auth=auth, verify=False, timeout=(5, 30))
+            if r_imp.status_code in (200, 201):
+                print(f"  ✅ Chunk {idx} imported successfully!", flush=True)
+            else:
+                r_exec = requests.post(f"{base_url}/execute", json={"script": f"/import file-name={file_name}"}, auth=auth, verify=False, timeout=(5, 30))
+                if r_exec.status_code in (200, 201):
+                    print(f"  ✅ Chunk {idx} executed successfully!", flush=True)
+                else:
+                    print(f"  ⚠️ Chunk {idx} import response: {r_exec.status_code} {r_exec.text}", flush=True)
+        except requests.RequestException as e:
+            print(f"  ⚠️ Chunk {idx} import request failed: {e}", flush=True)
+
+    print(f"\n✅ All {len(chunks)} chunks processed successfully ({total_items} rules total)!", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Sync Suricata malicious subnets to MikroTik via REST API (Option A).")
     parser.add_argument("--subnets-file", default="/opt/alert-bridge/malicious_subnets.txt", help="Path to malicious subnets file")
     parser.add_argument("--list-name", default="suricata-block", help="MikroTik address-list name (default: suricata-block)")
-    parser.add_argument("--save-rsc", help="Save generated .rsc to local file as well")
+    parser.add_argument("--chunk-size", type=int, default=3000, help="Chunk size for RSC file uploads (default: 3000)")
     args = parser.parse_args()
 
     if requests is None:
@@ -170,18 +173,8 @@ def main():
     optimized_items = deduplicate_subnets_and_ips(raw_items)
     print(f"Optimized to {len(optimized_items)} unique subnets/IPs (removed single IPs covered by subnets).", flush=True)
 
-    rsc_content = generate_rsc_content(optimized_items, args.list_name)
-
-    if args.save_rsc:
-        try:
-            with open(args.save_rsc, "w") as f:
-                f.write(rsc_content)
-            print(f"Saved local RSC script copy to '{args.save_rsc}'.", flush=True)
-        except Exception as e:
-            print(f"Warning: failed to save local RSC file: {e}", file=sys.stderr)
-
     auth = (mt_user, mt_pass)
-    upload_and_import_rsc(mt_host, auth, args.list_name, rsc_content)
+    upload_and_import_rsc_chunks(mt_host, auth, args.list_name, optimized_items, chunk_size=args.chunk_size)
 
 
 if __name__ == "__main__":
