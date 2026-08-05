@@ -13,11 +13,10 @@ import sys
 from collections import defaultdict
 
 
-def aggregate_ips_to_24(items: set[str], min_ips_per_24: int = 1) -> list[str]:
+def aggregate_ips_to_24(items: set[str], min_ips_per_24: int = 2) -> list[str]:
     """
     Aggregates individual IP addresses into parent /24 subnets (or /64 for IPv6).
-    If min_ips_per_24 is 1 (default), every single IP is converted to its parent /24 subnet.
-    If min_ips_per_24 > 1, single IPs are converted to /24 only if at least min_ips_per_24 IPs are in that subnet.
+    Single IPs are converted to /24 only if at least min_ips_per_24 (default: 2) IPs are in that subnet.
     """
     subnets = set()
     ip_groups = defaultdict(set)
@@ -58,7 +57,7 @@ def aggregate_ips_to_24(items: set[str], min_ips_per_24: int = 1) -> list[str]:
     return [str(net) for net in res]
 
 
-def extract_ips_from_rules(rules_path: str, aggregate_24: bool = True, min_ips_per_24: int = 1) -> list[str]:
+def extract_ips_from_rules(rules_path: str, aggregate_24: bool = True, min_ips_per_24: int = 2) -> list[str]:
     """
     Parses Suricata rules file and extracts IPs/subnets from bracketed source blocks
     in rules starting with 'alert <proto> [...]'.
@@ -120,7 +119,7 @@ def main():
     parser.add_argument("--output", help="Save extracted subnets to text file")
     parser.add_argument("--aggregate-24", action="store_true", default=True, help="Aggregate individual single IPs into /24 subnets (enabled by default)")
     parser.add_argument("--no-aggregate-24", dest="aggregate_24", action="store_false", help="Do not aggregate single IPs into /24 subnets")
-    parser.add_argument("--min-ips-per-24", type=int, default=1, help="Minimum single IPs in subnet required for /24 aggregation (default: 1)")
+    parser.add_argument("--min-ips-per-24", type=int, default=2, help="Minimum single IPs in subnet required for /24 aggregation (default: 2)")
     args = parser.parse_args()
 
     subnets = extract_ips_from_rules(args.rules_file, aggregate_24=args.aggregate_24, min_ips_per_24=args.min_ips_per_24)
