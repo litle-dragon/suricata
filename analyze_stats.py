@@ -190,4 +190,7 @@ def main():
 
         outbound_sum_agg = aggregate_subnet_24(total_outbound)
         print_table(period_str, "Outbound Summary", outbound_sum_agg)
+
+
+if __name__ == "__main__":
     main()
