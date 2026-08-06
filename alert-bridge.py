@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
-"""Suricata eve.json -> Telegram alert + MikroTik auto-block bridge.
+"""Suricata eve.json -> Telegram digest + MikroTik auto-block bridge.
 
 Follows eve.json like `tail -F` (survives logrotate), and for every alert
 with severity <= MAX_SEVERITY:
   - Classifies flow into Inbound (external attacker -> LAN) or Outbound (LAN -> external target)
-  - Tracks attempt history per IP and per /24 subnet in 2 state files:
-      1. /var/log/suricata/alert-bridge-state.json (Daily state, resets at midnight)
-      2. /var/log/suricata/alert-bridge-total-state.json (Cumulative total state across all days)
   - Inbound traffic: 1h block for hits 1-2. Escalates to PERMANENT block on MikroTik at hit >= 3.
-  - Subnet aggregation: when a /24 subnet reaches 10 unique attacker IPs today, blocks the entire /24 subnet permanently on MikroTik.
+  - Subnet aggregation: when a /24 subnet reaches 10 unique attacker IPs today, blocks the entire /24 permanently.
   - Outbound traffic: 1h temporary block on MikroTik.
-  - Telegram Digests:
-      1. 6-Hour Digest: new unique IPs (not seen before in history), new subnets, avg attacks, TOP subnets (>=2 IPs).
-      2. 07:00 AM Daily Report: summary for the previous day (total attacks, unique IPs, avg/IP, permanent blocks, TOP subnets).
+
+Persistence: SQLite at /var/log/suricata/alert_bridge.db (WAL mode) is the single
+system of record. Tables: seen_ips / seen_subnets (all-time uniqueness), daily_stats
+(full historical daily archive), slot_digests (6h slot archive), spike_events (anomaly log).
+
+Notifications (per-alert Telegram is DISABLED):
+  1. Anomaly / Spike Alert: fires only when the inbound alert rate over a sliding
+     5-minute window crosses SPIKE_THRESHOLD_N (default 500), with a 15-minute cooldown.
+  2. Fixed 6-hour slot digest: aligned to clock slots 00:00-05:59, 06:00-11:59,
+     12:00-17:59, 18:00-23:59; each sent at the following boundary.
+  3. 07:00 AM daily report: summary of the previous full day, read from daily_stats.
 """
 
 import ipaddress
 import json
 import os
+import sqlite3
 import time
 from collections import defaultdict
 
@@ -27,15 +33,18 @@ import urllib3
 urllib3.disable_warnings()  # self-signed cert on the router's www-ssl
 
 EVE_LOG = "/var/log/suricata/eve.json"
-STATE_FILE = "/var/log/suricata/alert-bridge-state.json"
-TOTAL_STATE_FILE = "/var/log/suricata/alert-bridge-total-state.json"
+DB_FILE = os.environ.get("DB_FILE", "/var/log/suricata/alert_bridge.db")
 MAX_SEVERITY = 2          # 1=high, 2=medium; 3=informational is ignored
 BLOCK_TIMEOUT = os.environ.get("BLOCK_TIMEOUT", "1h")  # temporary block duration
-COOLDOWN = 300            # seconds before re-alerting same ip+signature
+COOLDOWN = 300            # seconds before re-blocking same ip+signature
 BLOCK_LIST = "suricata-block"
 PERMANENT_THRESHOLD = 3   # Inbound attempts today before permanent block
 SUBNET_THRESHOLD = 10     # Unique IPs in /24 subnet today before blocking whole /24
-DIGEST_6H_INTERVAL = 6 * 3600  # 6 hours in seconds
+
+# Anomaly / spike detection over a sliding window
+SLIDING_WINDOW = 300      # 5-minute sliding window (seconds)
+SPIKE_COOLDOWN = 900      # 15-minute cooldown between spike alerts (seconds)
+SPIKE_THRESHOLD_N = int(os.environ.get("SPIKE_THRESHOLD_N", "500"))  # alerts / 5 min to trigger
 
 # Reputation-list hits: real enough to block, too common to page about
 QUIET_PREFIXES = ("ET DROP", "ET CINS", "ET TOR", "ET 3CORESec")
@@ -89,116 +98,134 @@ HOME_NETS = [
     for n in ("192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "100.64.0.0/10")
 ] + _wan_nets
 
-_recent: dict[str, float] = {}
+_recent: dict[str, float] = {}  # cooldown throttle for re-blocking
 
-# Journal 1: Daily state (resets at midnight)
-_daily_inbound_counts: dict[str, int] = {}
-_daily_outbound_counts: dict[str, int] = {}
-_daily_inbound_subnets: dict[str, dict] = {}   # { "subnet": {"unique_ips": [...], "total_alerts": int} }
-_daily_outbound_subnets: dict[str, dict] = {}
-_daily_permanent_count = 0
+# ── SQLite (system of record) ────────────────────────────────────────────────
+_conn: sqlite3.Connection | None = None
 
-# Journal 2: Total state (persistent forever)
-_total_inbound_counts: dict[str, int] = {}
-_total_outbound_counts: dict[str, int] = {}
-_total_inbound_subnets: dict[str, dict] = {}
-_total_outbound_subnets: dict[str, dict] = {}
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS seen_ips (
+    ip TEXT PRIMARY KEY,
+    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    total_hits INTEGER DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS seen_subnets (
+    subnet TEXT PRIMARY KEY,
+    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    total_hits INTEGER DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS daily_stats (
+    date TEXT PRIMARY KEY,
+    total_alerts INTEGER NOT NULL,
+    unique_ips INTEGER NOT NULL,
+    unique_subnets INTEGER NOT NULL,
+    new_ips_count INTEGER NOT NULL,
+    new_subnets_count INTEGER NOT NULL,
+    avg_alerts_per_ip INTEGER NOT NULL,
+    avg_alerts_per_subnet INTEGER NOT NULL,
+    perm_ips_count INTEGER NOT NULL,
+    perm_subnets_count INTEGER NOT NULL,
+    single_ips_count INTEGER NOT NULL,
+    single_ips_alerts INTEGER NOT NULL,
+    top_subnets_json TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS slot_digests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    slot_index INTEGER NOT NULL,
+    start_time TEXT NOT NULL,
+    end_time TEXT NOT NULL,
+    total_alerts INTEGER NOT NULL,
+    new_ips_count INTEGER NOT NULL,
+    new_subnets_count INTEGER NOT NULL,
+    avg_alerts_per_ip INTEGER NOT NULL,
+    avg_alerts_per_subnet INTEGER NOT NULL,
+    perm_ips_count INTEGER NOT NULL,
+    perm_subnets_count INTEGER NOT NULL,
+    single_ips_count INTEGER NOT NULL,
+    single_ips_alerts INTEGER NOT NULL,
+    top_subnets_json TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS spike_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    start_time TEXT NOT NULL,
+    end_time TEXT NOT NULL,
+    total_alerts INTEGER NOT NULL,
+    avg_rate_per_min INTEGER NOT NULL,
+    unique_ips INTEGER NOT NULL,
+    top_subnets_json TEXT NOT NULL
+);
+"""
 
-# 6-Hour New Threat Digest Tracking
-_recent_6h_new_ips: dict[str, dict] = {}  # { "ip": {"hits": int, "sig": str} }
-_last_6h_digest_time = time.time()
+# ── In-memory hot state ───────────────────────────────────────────────────────
+# All-time uniqueness caches (mirror of seen_ips / seen_subnets, loaded at startup)
+_all_time_seen_ips: set[str] = set()
+_all_time_seen_subnets: set[str] = set()
 
-# 07:00 AM Daily Report Tracking
-_last_7am_report_date = ""
-_yesterday_stats: dict = {}
+# 5-minute sliding window for anomaly detection
+_sliding_window_alerts: list[dict] = []   # {"time": float, "ip": str, "sig": str, "direction": str}
+_last_spike_alert_time = 0.0
 
-_quiet_blocks = 0
+# 6-hour slot counters (reset at slot boundaries 00/06/12/18)
+_slot_index = int(time.strftime("%H")) // 6
+_slot_alerts_count = 0
+_slot_inbound_counts: dict[str, int] = {}
+_slot_inbound_subnets: dict[str, dict] = {}   # subnet -> {"ips": set, "alerts": int}
+_slot_new_ips: set[str] = set()
+_slot_new_subnets: set[str] = set()
+_slot_perm_ips_count = 0
+_slot_perm_subnets_count = 0
+
+# Daily counters (reset at midnight)
 _digest_day = time.strftime("%Y-%m-%d")
+_daily_inbound_counts: dict[str, int] = {}
+_daily_inbound_subnets: dict[str, dict] = {}  # subnet -> {"ips": set, "alerts": int}
+_daily_outbound_counts: dict[str, int] = {}
+_daily_new_ips: set[str] = set()
+_daily_new_subnets: set[str] = set()
+_daily_permanent_ips_count = 0
+_daily_permanent_subnets_count = 0
+
+_last_7am_report_date = ""
 
 
-def load_state() -> None:
-    """Load daily state and total persistent state from JSON files if available."""
-    global _digest_day, _quiet_blocks, _daily_inbound_counts, _daily_outbound_counts, _daily_inbound_subnets, _daily_outbound_subnets, _daily_permanent_count
-    global _total_inbound_counts, _total_outbound_counts, _total_inbound_subnets, _total_outbound_subnets
-    global _recent_6h_new_ips, _last_6h_digest_time, _last_7am_report_date, _yesterday_stats
-    today = time.strftime("%Y-%m-%d")
-
-    # 1. Load Daily State
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                data = json.load(f)
-            saved_date = data.get("date", "")
-            if saved_date == today:
-                _digest_day = saved_date
-                _quiet_blocks = data.get("quiet_blocks", 0)
-                _daily_inbound_counts = data.get("inbound_counts", {})
-                _daily_outbound_counts = data.get("outbound_counts", {})
-                _daily_inbound_subnets = data.get("inbound_subnets", {})
-                _daily_outbound_subnets = data.get("outbound_subnets", {})
-                _daily_permanent_count = data.get("daily_permanent_count", 0)
-                _recent_6h_new_ips = data.get("recent_6h_new_ips", {})
-                _last_6h_digest_time = data.get("last_6h_digest_time", time.time())
-                _last_7am_report_date = data.get("last_7am_report_date", "")
-                _yesterday_stats = data.get("yesterday_stats", {})
-                print(f"loaded daily state for {today}: {_quiet_blocks} quiet blocks, "
-                      f"{len(_daily_inbound_counts)} inbound IPs, {len(_daily_inbound_subnets)} inbound subnets", flush=True)
-            else:
-                print(f"daily state file is from previous day ({saved_date}), starting fresh for {today}", flush=True)
-        except Exception as e:
-            print(f"warning: failed to load daily state file: {e}", flush=True)
-
-    # 2. Load Total State
-    if os.path.exists(TOTAL_STATE_FILE):
-        try:
-            with open(TOTAL_STATE_FILE, "r") as f:
-                t_data = json.load(f)
-            _total_inbound_counts = t_data.get("inbound_counts", {})
-            _total_outbound_counts = t_data.get("outbound_counts", {})
-            _total_inbound_subnets = t_data.get("inbound_subnets", {})
-            _total_outbound_subnets = t_data.get("outbound_subnets", {})
-            print(f"loaded total state: {len(_total_inbound_counts)} total inbound IPs, "
-                  f"{len(_total_inbound_subnets)} total inbound subnets", flush=True)
-        except Exception as e:
-            print(f"warning: failed to load total state file: {e}", flush=True)
+def db_init() -> None:
+    """Open the SQLite database (WAL mode), create tables, and warm uniqueness caches."""
+    global _conn, _all_time_seen_ips, _all_time_seen_subnets
+    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+    _conn = sqlite3.connect(DB_FILE, isolation_level=None)  # autocommit
+    _conn.execute("PRAGMA journal_mode=WAL;")
+    _conn.execute("PRAGMA synchronous=NORMAL;")
+    _conn.executescript(SCHEMA)
+    _all_time_seen_ips = {row[0] for row in _conn.execute("SELECT ip FROM seen_ips")}
+    _all_time_seen_subnets = {row[0] for row in _conn.execute("SELECT subnet FROM seen_subnets")}
+    print(f"opened {DB_FILE}: {len(_all_time_seen_ips)} known IPs, "
+          f"{len(_all_time_seen_subnets)} known subnets", flush=True)
 
 
-def save_state() -> None:
-    """Atomically save current daily and total states to JSON files."""
-    daily_state = {
-        "date": _digest_day,
-        "quiet_blocks": _quiet_blocks,
-        "inbound_counts": _daily_inbound_counts,
-        "outbound_counts": _daily_outbound_counts,
-        "inbound_subnets": _daily_inbound_subnets,
-        "outbound_subnets": _daily_outbound_subnets,
-        "daily_permanent_count": _daily_permanent_count,
-        "recent_6h_new_ips": _recent_6h_new_ips,
-        "last_6h_digest_time": _last_6h_digest_time,
-        "last_7am_report_date": _last_7am_report_date,
-        "yesterday_stats": _yesterday_stats,
-    }
-    tmp_daily = STATE_FILE + ".tmp"
-    try:
-        with open(tmp_daily, "w") as f:
-            json.dump(daily_state, f)
-        os.replace(tmp_daily, STATE_FILE)
-    except Exception as e:
-        print(f"warning: failed to save daily state file: {e}", flush=True)
+def db_seen_ip(ip: str, is_new: bool) -> None:
+    if is_new:
+        _conn.execute("INSERT OR IGNORE INTO seen_ips(ip) VALUES(?)", (ip,))
+    else:
+        _conn.execute(
+            "UPDATE seen_ips SET last_seen=CURRENT_TIMESTAMP, total_hits=total_hits+1 WHERE ip=?",
+            (ip,),
+        )
 
-    total_state = {
-        "inbound_counts": _total_inbound_counts,
-        "outbound_counts": _total_outbound_counts,
-        "inbound_subnets": _total_inbound_subnets,
-        "outbound_subnets": _total_outbound_subnets,
-    }
-    tmp_total = TOTAL_STATE_FILE + ".tmp"
-    try:
-        with open(tmp_total, "w") as f:
-            json.dump(total_state, f)
-        os.replace(tmp_total, TOTAL_STATE_FILE)
-    except Exception as e:
-        print(f"warning: failed to save total state file: {e}", flush=True)
+
+def db_seen_subnet(subnet: str, is_new: bool) -> None:
+    if is_new:
+        _conn.execute("INSERT OR IGNORE INTO seen_subnets(subnet) VALUES(?)", (subnet,))
+    else:
+        _conn.execute(
+            "UPDATE seen_subnets SET last_seen=CURRENT_TIMESTAMP, total_hits=total_hits+1 WHERE subnet=?",
+            (subnet,),
+        )
 
 
 def get_subnet(ip: str) -> str:
@@ -212,53 +239,49 @@ def get_subnet(ip: str) -> str:
 
 def record_hit(direction: str, ip: str, sig: str) -> tuple[int, str, int]:
     """
-    Records a hit for IP and its subnet in both daily and total state.
-    Track new IPs (never seen in history) for the 6h digest.
+    Records an inbound/outbound hit against slot + daily counters and updates
+    all-time uniqueness (seen_ips / seen_subnets) for inbound attackers.
     Returns: (ip_daily_count, subnet_str, subnet_daily_unique_count)
     """
     subnet_str = get_subnet(ip)
 
-    if direction == "inbound":
-        # Check if brand new IP (never seen in total history before)
-        if ip not in _total_inbound_counts:
-            entry = _recent_6h_new_ips.setdefault(ip, {"hits": 0, "sig": sig})
-            entry["hits"] += 1
-
-        _daily_inbound_counts[ip] = _daily_inbound_counts.get(ip, 0) + 1
-        ip_daily_count = _daily_inbound_counts[ip]
-
-        s_daily = _daily_inbound_subnets.setdefault(subnet_str, {"unique_ips": [], "total_alerts": 0})
-        if ip not in s_daily["unique_ips"]:
-            s_daily["unique_ips"].append(ip)
-        s_daily["total_alerts"] += 1
-        subnet_daily_unique_cnt = len(s_daily["unique_ips"])
-
-        _total_inbound_counts[ip] = _total_inbound_counts.get(ip, 0) + 1
-
-        s_total = _total_inbound_subnets.setdefault(subnet_str, {"unique_ips": [], "total_alerts": 0})
-        if ip not in s_total["unique_ips"]:
-            s_total["unique_ips"].append(ip)
-        s_total["total_alerts"] += 1
-
-        return ip_daily_count, subnet_str, subnet_daily_unique_cnt
-    else:
+    if direction != "inbound":
         _daily_outbound_counts[ip] = _daily_outbound_counts.get(ip, 0) + 1
-        ip_daily_count = _daily_outbound_counts[ip]
+        return _daily_outbound_counts[ip], subnet_str, 0
 
-        s_daily = _daily_outbound_subnets.setdefault(subnet_str, {"unique_ips": [], "total_alerts": 0})
-        if ip not in s_daily["unique_ips"]:
-            s_daily["unique_ips"].append(ip)
-        s_daily["total_alerts"] += 1
-        subnet_daily_unique_cnt = len(s_daily["unique_ips"])
+    global _slot_alerts_count
 
-        _total_outbound_counts[ip] = _total_outbound_counts.get(ip, 0) + 1
+    # All-time uniqueness (never seen before in history)
+    is_new_ip = ip not in _all_time_seen_ips
+    if is_new_ip:
+        _all_time_seen_ips.add(ip)
+        _slot_new_ips.add(ip)
+        _daily_new_ips.add(ip)
+    db_seen_ip(ip, is_new_ip)
 
-        s_total = _total_outbound_subnets.setdefault(subnet_str, {"unique_ips": [], "total_alerts": 0})
-        if ip not in s_total["unique_ips"]:
-            s_total["unique_ips"].append(ip)
-        s_total["total_alerts"] += 1
+    is_new_subnet = subnet_str not in _all_time_seen_subnets
+    if is_new_subnet:
+        _all_time_seen_subnets.add(subnet_str)
+        _slot_new_subnets.add(subnet_str)
+        _daily_new_subnets.add(subnet_str)
+    db_seen_subnet(subnet_str, is_new_subnet)
 
-        return ip_daily_count, subnet_str, subnet_daily_unique_cnt
+    # Slot counters
+    _slot_alerts_count += 1
+    _slot_inbound_counts[ip] = _slot_inbound_counts.get(ip, 0) + 1
+    s_slot = _slot_inbound_subnets.setdefault(subnet_str, {"ips": set(), "alerts": 0})
+    s_slot["ips"].add(ip)
+    s_slot["alerts"] += 1
+
+    # Daily counters (drive block thresholds + midnight snapshot)
+    _daily_inbound_counts[ip] = _daily_inbound_counts.get(ip, 0) + 1
+    ip_daily_count = _daily_inbound_counts[ip]
+    s_daily = _daily_inbound_subnets.setdefault(subnet_str, {"ips": set(), "alerts": 0})
+    s_daily["ips"].add(ip)
+    s_daily["alerts"] += 1
+    subnet_daily_unique_cnt = len(s_daily["ips"])
+
+    return ip_daily_count, subnet_str, subnet_daily_unique_cnt
 
 
 def whitelisted(ip: str) -> bool:
@@ -377,156 +400,261 @@ def mikrotik_block(ip_or_subnet: str, signature: str, permanent: bool = False) -
         return False
 
 
-def send_6h_new_threats_digest(start_time_str: str, end_time_str: str) -> None:
-    """Generates and sends 6-hour new threat digest via Telegram."""
-    global _recent_6h_new_ips
-    if not _recent_6h_new_ips:
-        return
-
-    total_new_ips = len(_recent_6h_new_ips)
-    total_new_hits = sum(info.get("hits", 1) for info in _recent_6h_new_ips.values())
-    avg_hits_per_new_ip = total_new_hits / total_new_ips if total_new_ips > 0 else 0.0
-
-    # Group new IPs by /24 subnet
-    new_subnets = defaultdict(lambda: {"unique_ips": set(), "total_hits": 0})
-    for ip, info in _recent_6h_new_ips.items():
-        subnet_str = get_subnet(ip)
-        new_subnets[subnet_str]["unique_ips"].add(ip)
-        new_subnets[subnet_str]["total_hits"] += info.get("hits", 1)
-
-    total_new_subnets = len(new_subnets)
-
-    top_subnets = []
-    single_new_ips_count = 0
-    single_new_ips_hits = 0
-
-    for subnet_str, s_info in new_subnets.items():
-        unique_cnt = len(s_info["unique_ips"])
-        hits_cnt = s_info["total_hits"]
-        if unique_cnt >= 2:
-            avg_sub_hits = hits_cnt / unique_cnt if unique_cnt > 0 else 0.0
-            top_subnets.append((subnet_str, unique_cnt, hits_cnt, avg_sub_hits))
+# ── Aggregation & formatting helpers ──────────────────────────────────────────
+def _top_and_singles(subnets: dict) -> tuple[list[dict], int, int]:
+    """
+    From {subnet: {"ips": set, "alerts": int}} build:
+      - top list (subnets with >= 2 IPs), sorted by alerts desc then IPs desc
+      - single_ips_count / single_ips_alerts (subnets with exactly 1 IP, i.e.
+        addresses that did not aggregate into a /24)
+    """
+    top: list[dict] = []
+    single_count = 0
+    single_alerts = 0
+    for subnet, info in subnets.items():
+        ip_cnt = len(info["ips"])
+        alerts = info["alerts"]
+        if ip_cnt >= 2:
+            top.append({
+                "subnet": subnet,
+                "ips": ip_cnt,
+                "alerts": alerts,
+                "avg": round(alerts / ip_cnt),
+            })
         else:
-            single_new_ips_count += unique_cnt
-            single_new_ips_hits += hits_cnt
+            single_count += ip_cnt
+            single_alerts += alerts
+    top.sort(key=lambda x: (x["alerts"], x["ips"]), reverse=True)
+    return top[:10], single_count, single_alerts
 
-    top_subnets.sort(key=lambda x: (x[2], x[1]), reverse=True)
+
+def _format_top_lines(top: list[dict]) -> list[str]:
+    lines = ["ТОП10 підмереж по алертам (/24, від 2+ IP):"]
+    for t in top:
+        lines.append(
+            f"• {t['subnet']} — {t['ips']:,} IP | {t['alerts']:,} алертів "
+            f"(сер. {t['avg']:,} алерти/IP)"
+        )
+    return lines
+
+
+def _slot_bounds(slot_index: int) -> tuple[str, str]:
+    start_h = slot_index * 6
+    end_h = start_h + 5
+    return f"{start_h:02d}:00", f"{end_h:02d}:59"
+
+
+# ── Notification builders ─────────────────────────────────────────────────────
+def send_spike_alert(now: float) -> None:
+    """Anomaly / spike alert built from the current 5-minute sliding window."""
+    total = len(_sliding_window_alerts)
+    unique_ips = len({e["ip"] for e in _sliding_window_alerts})
+    avg_rate = round(total / (SLIDING_WINDOW / 60))  # alerts per minute over the window
+
+    subnets: dict[str, dict] = {}
+    for e in _sliding_window_alerts:
+        subnet = get_subnet(e["ip"])
+        info = subnets.setdefault(subnet, {"ips": set(), "alerts": 0})
+        info["ips"].add(e["ip"])
+        info["alerts"] += 1
+    top, single_count, single_alerts = _top_and_singles(subnets)
+
+    start = time.strftime("%H:%M", time.localtime(now - SLIDING_WINDOW))
+    end = time.strftime("%H:%M", time.localtime(now))
 
     lines = [
-        "📊 6-годинний дайджест нових загроз 📥",
-        f"Період: {start_time_str} - {end_time_str}",
+        "🚨 АНОМАЛЬНИЙ СПЛЕСК АТАК (Spike Alert) ⚠️",
+        f"Період: {start} - {end} (останні 5 хвилин)",
         "",
-        f"• Унікальних нових IP (раніше не бачили): {total_new_ips}",
-        f"• Нових унікальних мереж (/24): {total_new_subnets}",
-        f"• Середня кількість атак на новий IP: {avg_hits_per_new_ip:.2f}",
+        f"• Всього алертів за 5 хв: {total:,} (поріг: N = {SPIKE_THRESHOLD_N:,})",
+        f"• Середня інтенсивність: {avg_rate:,} алертів/хв",
+        f"• Унікальних IP-атакуючих: {unique_ips:,}",
         "",
     ]
-
-    if top_subnets:
-        lines.append("ТОП підмереж (/24, від 2+ нових IP):")
-        for sub_str, u_cnt, h_cnt, avg_h in top_subnets[:10]:
-            lines.append(f"• {sub_str} — {u_cnt} нових IP | {h_cnt} атак (сер. {avg_h:.2f}/IP)")
+    if top:
+        lines += _format_top_lines(top)
         lines.append("")
+    lines.append(f"Поодинокі нові IP: {single_count:,} IP (всього {single_alerts:,} алертів)")
 
-    if single_new_ips_count > 0:
-        lines.append(f"Поодинокі нові IP (менше 2 IP в мережі): {single_new_ips_count} IP (всього {single_new_ips_hits} атак)")
+    telegram_send("\n".join(lines))
+    _conn.execute(
+        "INSERT INTO spike_events(start_time, end_time, total_alerts, avg_rate_per_min, "
+        "unique_ips, top_subnets_json) VALUES(?,?,?,?,?,?)",
+        (start, end, total, avg_rate, unique_ips, json.dumps(top)),
+    )
+    print(f"spike-alert total={total} rate={avg_rate}/min unique_ips={unique_ips}", flush=True)
 
-    text = "\n".join(lines)
-    telegram_send(text)
-    _recent_6h_new_ips.clear()
+
+def send_6h_slot_digest(slot_index: int, day: str) -> None:
+    """Fixed 6-hour slot digest for the just-completed slot; archives to slot_digests."""
+    total = _slot_alerts_count
+    unique_ips = len(_slot_inbound_counts)
+    unique_subnets = len(_slot_inbound_subnets)
+    new_ips = len(_slot_new_ips)
+    new_subnets = len(_slot_new_subnets)
+    avg_per_ip = round(total / unique_ips) if unique_ips else 0
+    avg_per_subnet = round(total / unique_subnets) if unique_subnets else 0
+    top, single_count, single_alerts = _top_and_singles(_slot_inbound_subnets)
+    start, end = _slot_bounds(slot_index)
+
+    lines = [
+        "📊 6-годинний дайджест нових загроз",
+        f"Період: {start} - {end} ({day})",
+        "",
+        f"• Всього алертів за 6 годин: {total:,}",
+        f"• Унікальних нових IP (раніше не бачили): {new_ips:,}",
+        f"• Унікальних нових підмереж (раніше не бачили): {new_subnets:,}",
+        f"• Середня кількість алертів на 1 IP: {avg_per_ip:,}",
+        f"• Середня кількість алертів на 1 підмережу: {avg_per_subnet:,}",
+        f"• Додано в постійний блок ІР за 6 годин: {_slot_perm_ips_count:,}",
+        f"• Додано в постійний блок підмереж за 6 годин: {_slot_perm_subnets_count:,}",
+        "",
+    ]
+    if top:
+        lines += _format_top_lines(top)
+        lines.append("")
+    lines.append(
+        f"Поодинокі нові IP (адреси які не агрегувалися в підмережі): "
+        f"{single_count:,} IP (всього {single_alerts:,} алертів)"
+    )
+
+    telegram_send("\n".join(lines))
+    _conn.execute(
+        "INSERT INTO slot_digests(date, slot_index, start_time, end_time, total_alerts, "
+        "new_ips_count, new_subnets_count, avg_alerts_per_ip, avg_alerts_per_subnet, "
+        "perm_ips_count, perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (day, slot_index, start, end, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
+         _slot_perm_ips_count, _slot_perm_subnets_count, single_count, single_alerts, json.dumps(top)),
+    )
+    print(f"slot-digest slot={slot_index} {start}-{end} total={total} new_ips={new_ips}", flush=True)
+
+
+def snapshot_daily_stats(day: str) -> None:
+    """Capture the completed day's summary into daily_stats at midnight rollover."""
+    total = sum(_daily_inbound_counts.values())
+    unique_ips = len(_daily_inbound_counts)
+    unique_subnets = len(_daily_inbound_subnets)
+    new_ips = len(_daily_new_ips)
+    new_subnets = len(_daily_new_subnets)
+    avg_per_ip = round(total / unique_ips) if unique_ips else 0
+    avg_per_subnet = round(total / unique_subnets) if unique_subnets else 0
+    top, single_count, single_alerts = _top_and_singles(_daily_inbound_subnets)
+
+    _conn.execute(
+        "INSERT OR REPLACE INTO daily_stats(date, total_alerts, unique_ips, unique_subnets, "
+        "new_ips_count, new_subnets_count, avg_alerts_per_ip, avg_alerts_per_subnet, "
+        "perm_ips_count, perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (day, total, unique_ips, unique_subnets, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
+         _daily_permanent_ips_count, _daily_permanent_subnets_count, single_count, single_alerts,
+         json.dumps(top)),
+    )
+    print(f"daily-snapshot {day} total={total} unique_ips={unique_ips} new_ips={new_ips}", flush=True)
 
 
 def send_7am_daily_report() -> None:
-    """Generates and sends 07:00 AM daily report for yesterday's statistics."""
-    global _yesterday_stats
-    if not _yesterday_stats or "date" not in _yesterday_stats:
+    """07:00 AM report for the previous full day, read from daily_stats."""
+    yesterday = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+    row = _conn.execute(
+        "SELECT date, total_alerts, new_ips_count, new_subnets_count, avg_alerts_per_ip, "
+        "avg_alerts_per_subnet, perm_ips_count, perm_subnets_count, single_ips_count, "
+        "single_ips_alerts, top_subnets_json FROM daily_stats WHERE date=?",
+        (yesterday,),
+    ).fetchone()
+    if not row:
+        print(f"7am-report skipped: no daily_stats row for {yesterday}", flush=True)
         return
 
-    y_date = _yesterday_stats.get("date", "")
-    total_alerts = _yesterday_stats.get("total_alerts", 0)
-    unique_ips = _yesterday_stats.get("unique_ips", 0)
-    perm_count = _yesterday_stats.get("permanent_count", 0)
-    inbound_counts = _yesterday_stats.get("inbound_counts", {})
-
-    avg_alerts_per_ip = total_alerts / unique_ips if unique_ips > 0 else 0.0
-
-    # Group yesterday's inbound counts by /24 subnet (min 2 IPs)
-    subnets = defaultdict(lambda: {"ips": set(), "total_alerts": 0})
-    for ip, cnt in inbound_counts.items():
-        sub_str = get_subnet(ip)
-        subnets[sub_str]["ips"].add(ip)
-        subnets[sub_str]["total_alerts"] += cnt
-
-    top_subnets = []
-    for sub_str, s_info in subnets.items():
-        u_cnt = len(s_info["ips"])
-        alerts_cnt = s_info["total_alerts"]
-        if u_cnt >= 2:
-            avg_sub_alerts = alerts_cnt / u_cnt if u_cnt > 0 else 0.0
-            top_subnets.append((sub_str, u_cnt, alerts_cnt, avg_sub_alerts))
-
-    top_subnets.sort(key=lambda x: (x[2], x[1]), reverse=True)
+    (day, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
+     perm_ips, perm_subnets, single_count, single_alerts, top_json) = row
+    top = json.loads(top_json)
 
     lines = [
-        f"🌅 Звіт за попередній день ({y_date}) 📊",
+        f"🌅 Звіт за попередній день ({day}) 📊",
         "",
-        f"• Всього атак за добу: {total_alerts:,}",
-        f"• Унікальних IP-атакуючих: {unique_ips:,}",
-        f"• Середня кількість атак на 1 IP: {avg_alerts_per_ip:.2f}",
-        f"• Додано в пермаментний блок за добу: {perm_count:,}",
+        f"• Всього алертів за добу: {total:,}",
+        f"• Унікальних нових IP (раніше не бачили): {new_ips:,}",
+        f"• Унікальних нових підмереж (раніше не бачили): {new_subnets:,}",
+        f"• Середня кількість алертів на 1 IP: {avg_per_ip:,}",
+        f"• Середня кількість алертів на 1 підмережу: {avg_per_subnet:,}",
+        f"• Додано в постійний блок ІР за добу: {perm_ips:,}",
+        f"• Додано в постійний блок підмереж за добу: {perm_subnets:,}",
         "",
     ]
+    if top:
+        lines += _format_top_lines(top)
+        lines.append("")
+    lines.append(
+        f"Поодинокі нові IP (адреси які не агрегувалися в підмережі): "
+        f"{single_count:,} IP (всього {single_alerts:,} алертів)"
+    )
 
-    if top_subnets:
-        lines.append("ТОП підмереж (/24, від 2+ IP):")
-        for sub_str, u_cnt, a_cnt, avg_a in top_subnets[:10]:
-            lines.append(f"• {sub_str} — {u_cnt} IP | {a_cnt} атак (сер. {avg_a:.2f}/IP)")
+    telegram_send("\n".join(lines))
+    print(f"7am-report sent for {day}", flush=True)
 
-    text = "\n".join(lines)
-    telegram_send(text)
+
+def _reset_slot_state(new_slot: int) -> None:
+    global _slot_index, _slot_alerts_count, _slot_perm_ips_count, _slot_perm_subnets_count
+    _slot_index = new_slot
+    _slot_alerts_count = 0
+    _slot_perm_ips_count = 0
+    _slot_perm_subnets_count = 0
+    _slot_inbound_counts.clear()
+    _slot_inbound_subnets.clear()
+    _slot_new_ips.clear()
+    _slot_new_subnets.clear()
+
+
+def _reset_daily_state(new_day: str) -> None:
+    global _digest_day, _daily_permanent_ips_count, _daily_permanent_subnets_count
+    _digest_day = new_day
+    _daily_permanent_ips_count = 0
+    _daily_permanent_subnets_count = 0
+    _daily_inbound_counts.clear()
+    _daily_inbound_subnets.clear()
+    _daily_outbound_counts.clear()
+    _daily_new_ips.clear()
+    _daily_new_subnets.clear()
+
+
+def check_spike(now: float) -> None:
+    """Prune the sliding window and fire an anomaly alert if the threshold is crossed."""
+    global _last_spike_alert_time
+    cutoff = now - SLIDING_WINDOW
+    while _sliding_window_alerts and _sliding_window_alerts[0]["time"] < cutoff:
+        _sliding_window_alerts.pop(0)
+    if len(_sliding_window_alerts) >= SPIKE_THRESHOLD_N and (now - _last_spike_alert_time) >= SPIKE_COOLDOWN:
+        send_spike_alert(now)
+        _last_spike_alert_time = now
 
 
 def check_periodic_tasks() -> None:
-    global _quiet_blocks, _digest_day, _daily_inbound_counts, _daily_outbound_counts, _daily_inbound_subnets, _daily_outbound_subnets
-    global _daily_permanent_count, _last_6h_digest_time, _last_7am_report_date, _yesterday_stats
+    global _last_7am_report_date
     now = time.time()
     today = time.strftime("%Y-%m-%d")
-    current_hour = time.strftime("%H")
+    current_hour = int(time.strftime("%H"))
+    cur_slot = current_hour // 6
 
-    # 1. Day Rollover at Midnight
+    # Prune the sliding window even when idle (no new alerts arriving)
+    cutoff = now - SLIDING_WINDOW
+    while _sliding_window_alerts and _sliding_window_alerts[0]["time"] < cutoff:
+        _sliding_window_alerts.pop(0)
+
+    # 1. 6-hour slot boundary: emit digest for the completed slot, then reset
+    if cur_slot != _slot_index:
+        send_6h_slot_digest(_slot_index, _digest_day)
+        _reset_slot_state(cur_slot)
+
+    # 2. Midnight rollover: archive the completed day, then reset daily counters
     if today != _digest_day:
-        # Snapshot yesterday's stats before resetting daily counters
-        _yesterday_stats = {
-            "date": _digest_day,
-            "total_alerts": sum(_daily_inbound_counts.values()),
-            "unique_ips": len(_daily_inbound_counts),
-            "permanent_count": _daily_permanent_count,
-            "inbound_counts": dict(_daily_inbound_counts),
-            "inbound_subnets": dict(_daily_inbound_subnets),
-        }
+        snapshot_daily_stats(_digest_day)
+        _reset_daily_state(today)
 
-        _digest_day = today
-        _quiet_blocks = 0
-        _daily_permanent_count = 0
-        _daily_inbound_counts.clear()
-        _daily_outbound_counts.clear()
-        _daily_inbound_subnets.clear()
-        _daily_outbound_subnets.clear()
-        save_state()
-
-    # 2. 6-Hour New Threat Digest (every 6 hours)
-    if now - _last_6h_digest_time >= DIGEST_6H_INTERVAL:
-        start_time = time.strftime("%H:%M", time.localtime(_last_6h_digest_time))
-        end_time = time.strftime("%H:%M", time.localtime(now))
-        _last_6h_digest_time = now
-        send_6h_new_threats_digest(start_time, f"{end_time} ({today})")
-        save_state()
-
-    # 3. 07:00 AM Daily Report (for yesterday's stats)
-    if current_hour >= "07" and _last_7am_report_date != today:
+    # 3. 07:00 AM daily report for the previous day
+    if current_hour >= 7 and _last_7am_report_date != today:
         _last_7am_report_date = today
         send_7am_daily_report()
-        save_state()
 
 
 def follow(path: str):
@@ -556,9 +684,13 @@ def follow(path: str):
 
 
 def main() -> None:
-    global _quiet_blocks, _daily_permanent_count
-    load_state()
-    print(f"following {EVE_LOG}, blocking via {MT_HOST}", flush=True)
+    global _last_7am_report_date, _daily_permanent_ips_count, _daily_permanent_subnets_count
+    global _slot_perm_ips_count, _slot_perm_subnets_count
+    db_init()
+    # Startup guard: if we boot after 07:00, don't re-fire yesterday's report on every restart.
+    if int(time.strftime("%H")) >= 7:
+        _last_7am_report_date = time.strftime("%Y-%m-%d")
+    print(f"following {EVE_LOG}, blocking via {MT_HOST}, spike N={SPIKE_THRESHOLD_N}", flush=True)
     for line in follow(EVE_LOG):
         check_periodic_tasks()
         try:
@@ -576,67 +708,52 @@ def main() -> None:
             continue
 
         sig = alert.get("signature", "")
-        quiet = sig.startswith(QUIET_PREFIXES)
+        now = time.time()
 
         if direction == "inbound":
             attempts, subnet_str, subnet_unique_cnt = record_hit("inbound", target_ip, sig)
 
-            # Subnet Aggregation Threshold: block entire /24 if 10 unique IPs reached today
+            # Feed anomaly detection with every inbound alert (rate, not per-alert paging)
+            _sliding_window_alerts.append(
+                {"time": now, "ip": target_ip, "sig": sig, "direction": "inbound"}
+            )
+            check_spike(now)
+
+            # Subnet aggregation: block entire /24 once 10 unique IPs reached today
             if subnet_unique_cnt == SUBNET_THRESHOLD:
                 blocked_sub = mikrotik_block(subnet_str, f"SUBNET BLOCK (10+ IPs): {sig}", permanent=True)
-                print(f"subnet-block {sig} subnet={subnet_str} unique_ips={subnet_unique_cnt} permanent=True blocked={blocked_sub}", flush=True)
+                if blocked_sub:
+                    _slot_perm_subnets_count += 1
+                    _daily_permanent_subnets_count += 1
+                print(f"subnet-block {sig} subnet={subnet_str} unique_ips={subnet_unique_cnt} "
+                      f"permanent=True blocked={blocked_sub}", flush=True)
 
             if attempts > PERMANENT_THRESHOLD:
-                save_state()
                 continue
 
             permanent = (attempts == PERMANENT_THRESHOLD)
 
             if not permanent and not cooled_down(f"inbound|{target_ip}|{alert.get('signature_id')}"):
-                save_state()
                 continue
 
             blocked = mikrotik_block(target_ip, sig, permanent=permanent)
-            if permanent:
-                _daily_permanent_count += 1
+            if permanent and blocked:
+                _slot_perm_ips_count += 1
+                _daily_permanent_ips_count += 1
 
-            if quiet:
-                _quiet_blocks += 1
-            else:
-                telegram_send(
-                    "🚨 Suricata alert (Inbound 📥)\n"
-                    f"{sig}\n"
-                    f"{ev.get('src_ip')}:{ev.get('src_port', '')} → {ev.get('dest_ip')}:{ev.get('dest_port', '')}\n"
-                    f"severity {alert.get('severity')} · attempt {attempts}/{PERMANENT_THRESHOLD} today · "
-                    + (f"⛔ blocked {BLOCK_TIMEOUT}" if blocked else "⚠️ block FAILED")
-                )
             print(f"inbound-alert {sig} attacker={target_ip} attempts={attempts} "
                   f"permanent={permanent} blocked={blocked}", flush=True)
 
         else:
-            # Outbound traffic (LAN -> WAN)
-            attempts, subnet_str, subnet_unique_cnt = record_hit("outbound", target_ip, sig)
+            # Outbound traffic (LAN -> WAN): always a 1h temporary block, no digest
+            attempts, subnet_str, _ = record_hit("outbound", target_ip, sig)
 
             if not cooled_down(f"outbound|{target_ip}|{alert.get('signature_id')}"):
-                save_state()
                 continue
 
             blocked = mikrotik_block(target_ip, sig, permanent=False)
-
-            if quiet:
-                _quiet_blocks += 1
-            else:
-                telegram_send(
-                    "🚨 Suricata alert (Outbound 📤)\n"
-                    f"{sig}\n"
-                    f"{ev.get('src_ip')}:{ev.get('src_port', '')} → {ev.get('dest_ip')}:{ev.get('dest_port', '')}\n"
-                    f"severity {alert.get('severity')} · hit {attempts} today · "
-                    + (f"⛔ blocked {BLOCK_TIMEOUT}" if blocked else "⚠️ block FAILED")
-                )
             print(f"outbound-alert {sig} target={target_ip} hits={attempts} "
                   f"blocked={blocked}", flush=True)
-
-        save_state()
 
 
 if __name__ == "__main__":

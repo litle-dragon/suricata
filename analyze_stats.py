@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Analyze Suricata alert bridge statistics by /24 subnets.
+"""Analyze the Suricata alert-bridge SQLite database.
 
-Modes:
-  - Default: analyzes current day state file (/var/log/suricata/alert-bridge-state.json)
-  - With --sum / --total: analyzes all-time cumulative state file (/var/log/suricata/alert-bridge-total-state.json)
-  - With --journal: parses historical journalctl logs
-  - With --sync-mikrotik: blocks subnets with >=10 unique IPs on MikroTik and removes redundant single IPs
+Reads /var/log/suricata/alert_bridge.db directly (no journal parsing):
+  --sum                 Summary across every recorded day (daily_stats).
+  --day YYYY-MM-DD      Full breakdown for one historical day.
+  --spikes              Log of all anomaly spike alerts (spike_events).
+  --top N               Top N attacker subnets and IPs all-time (seen_subnets / seen_ips).
+  --sync-mikrotik       Block /24 subnets with >= MIN unique IPs all-time on MikroTik.
+
+With no mode given, prints the --sum summary.
 """
 
 import argparse
 import ipaddress
 import json
 import os
-import re
-import subprocess
+import sqlite3
 import sys
 from collections import defaultdict
 
@@ -23,6 +25,8 @@ try:
     urllib3.disable_warnings()
 except ImportError:
     requests = None
+
+DB_FILE = os.environ.get("DB_FILE", "/var/log/suricata/alert_bridge.db")
 
 
 def load_env():
@@ -44,95 +48,132 @@ def load_env():
             print(f"Warning: failed to read {env_path}: {e}", file=sys.stderr)
 
 
-def parse_journal_logs() -> dict[str, dict[str, dict[str, int]]]:
-    days_data = defaultdict(lambda: {"inbound": defaultdict(int), "outbound": defaultdict(int)})
-    try:
-        cmd = ["journalctl", "-u", "alert-bridge", "--output=short-iso", "--no-pager"]
-        output = subprocess.check_output(cmd, text=True, errors="replace")
-    except Exception as e:
-        print(f"Warning: failed to read journalctl: {e}", file=sys.stderr)
-        return days_data
-
-    date_pattern = re.compile(r"(\d{4}-\d{2}-\d{2})")
-    inbound_pattern = re.compile(r"attacker=([0-9a-fA-F:\.]+)")
-    outbound_pattern = re.compile(r"target=([0-9a-fA-F:\.]+)")
-
-    for line in output.splitlines():
-        date_match = date_pattern.search(line)
-        if not date_match:
-            continue
-        day = date_match.group(1)
-
-        in_match = inbound_pattern.search(line)
-        if in_match:
-            ip = in_match.group(1)
-            days_data[day]["inbound"][ip] += 1
-            continue
-
-        out_match = outbound_pattern.search(line)
-        if out_match:
-            ip = out_match.group(1)
-            days_data[day]["outbound"][ip] += 1
-            continue
-
-    return days_data
+def connect_db() -> sqlite3.Connection | None:
+    if not os.path.exists(DB_FILE):
+        print(f"Error: database not found at {DB_FILE}. Is alert-bridge running?", file=sys.stderr)
+        return None
+    conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def load_state_file(path: str) -> dict:
-    if os.path.exists(path):
-        try:
-            with open(path, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Warning: failed to load {path}: {e}", file=sys.stderr)
-    return {}
-
-
-def aggregate_subnet_24(ip_counts: dict[str, int], min_ips: int = 5) -> list[tuple[str, int, int]]:
-    subnets = defaultdict(lambda: {"ips": set(), "total_alerts": 0})
-
-    for ip_str, count in ip_counts.items():
+def aggregate_seen_subnets(conn: sqlite3.Connection, min_ips: int = 1) -> list[tuple[str, int, int]]:
+    """Aggregate seen_ips into /24 (or /64) subnets: (subnet, unique_ips, total_hits)."""
+    subnets = defaultdict(lambda: {"ips": set(), "hits": 0})
+    for row in conn.execute("SELECT ip, total_hits FROM seen_ips"):
+        ip_str, hits = row["ip"], row["total_hits"]
         try:
             ip_obj = ipaddress.ip_address(ip_str)
             prefix = 24 if ip_obj.version == 4 else 64
             net_str = str(ipaddress.ip_network(f"{ip_str}/{prefix}", strict=False))
         except ValueError:
             continue
-
         subnets[net_str]["ips"].add(ip_str)
-        subnets[net_str]["total_alerts"] += count
-
-    res = []
-    for net_str, info in subnets.items():
-        unique_cnt = len(info["ips"])
-        if unique_cnt >= min_ips:
-            res.append((net_str, unique_cnt, info["total_alerts"]))
-
+        subnets[net_str]["hits"] += hits
+    res = [
+        (net, len(info["ips"]), info["hits"])
+        for net, info in subnets.items()
+        if len(info["ips"]) >= min_ips
+    ]
     res.sort(key=lambda x: (x[2], x[1]), reverse=True)
     return res
 
 
-def print_table(title: str, direction: str, aggregated: list[tuple[str, int, int]]):
-    if not aggregated:
-        print(f"\n📅 {title} | Traffic: {direction.upper()}")
-        print("No subnets matched criteria (min unique IPs).")
+def cmd_sum(conn: sqlite3.Connection):
+    rows = list(conn.execute(
+        "SELECT date, total_alerts, unique_ips, unique_subnets, new_ips_count, "
+        "new_subnets_count, perm_ips_count, perm_subnets_count FROM daily_stats ORDER BY date"
+    ))
+    if not rows:
+        print("No daily statistics recorded yet (daily_stats is empty).")
         return
 
-    total_subnets = len(aggregated)
-    total_unique_ips = sum(unique_ips for _, unique_ips, _ in aggregated)
-    total_alerts = sum(alerts for _, _, alerts in aggregated)
-    avg_ips_per_subnet = total_unique_ips / total_subnets if total_subnets > 0 else 0.0
+    print(f"\n📊 Daily summary — {rows[0]['date']} .. {rows[-1]['date']} ({len(rows)} days)")
+    print("=" * 92)
+    print(f"{'Date':<12} | {'Alerts':>10} | {'Uniq IP':>9} | {'New IP':>9} | "
+          f"{'Uniq Net':>9} | {'New Net':>8} | {'PermIP':>7} | {'PermNet':>7}")
+    print("-" * 92)
+    tot_alerts = tot_new_ips = tot_new_nets = tot_perm_ips = tot_perm_nets = 0
+    for r in rows:
+        print(f"{r['date']:<12} | {r['total_alerts']:>10,} | {r['unique_ips']:>9,} | "
+              f"{r['new_ips_count']:>9,} | {r['unique_subnets']:>9,} | {r['new_subnets_count']:>8,} | "
+              f"{r['perm_ips_count']:>7,} | {r['perm_subnets_count']:>7,}")
+        tot_alerts += r["total_alerts"]
+        tot_new_ips += r["new_ips_count"]
+        tot_new_nets += r["new_subnets_count"]
+        tot_perm_ips += r["perm_ips_count"]
+        tot_perm_nets += r["perm_subnets_count"]
+    print("-" * 92)
+    print(f"Totals: {tot_alerts:,} alerts | {tot_new_ips:,} new IPs | {tot_new_nets:,} new subnets | "
+          f"{tot_perm_ips:,} perm IPs | {tot_perm_nets:,} perm subnets")
+    print("=" * 92)
 
-    print(f"\n📅 {title} | Traffic: {direction.upper()}")
+
+def cmd_day(conn: sqlite3.Connection, day: str):
+    r = conn.execute("SELECT * FROM daily_stats WHERE date=?", (day,)).fetchone()
+    if not r:
+        print(f"No record for {day}. Available days: use --sum to list.")
+        return
+    top = json.loads(r["top_subnets_json"])
+    print(f"\n🌅 Day report ({day})")
     print("=" * 65)
-    print(f"{'Subnet (/24)':<22} | {'Unique IPs':<12} | {'Total Alerts':<12}")
-    print("-" * 65)
-    for net_str, unique_ips, alerts in aggregated:
-        print(f"{net_str:<22} | {unique_ips:<12} | {alerts:<12}")
-    print("-" * 65)
-    print(f"Summary: {total_subnets} subnets | {total_unique_ips} total unique IPs | "
-          f"Avg IPs/subnet: {avg_ips_per_subnet:.2f} | Total alerts: {total_alerts}")
+    print(f"• Total alerts:              {r['total_alerts']:,}")
+    print(f"• Unique IPs:                {r['unique_ips']:,}")
+    print(f"• New IPs (never seen):      {r['new_ips_count']:,}")
+    print(f"• Unique subnets:            {r['unique_subnets']:,}")
+    print(f"• New subnets (never seen):  {r['new_subnets_count']:,}")
+    print(f"• Avg alerts / IP:           {r['avg_alerts_per_ip']:,}")
+    print(f"• Avg alerts / subnet:       {r['avg_alerts_per_subnet']:,}")
+    print(f"• Permanent IP blocks:       {r['perm_ips_count']:,}")
+    print(f"• Permanent subnet blocks:   {r['perm_subnets_count']:,}")
+    print(f"• Single (non-aggregated):   {r['single_ips_count']:,} IPs ({r['single_ips_alerts']:,} alerts)")
+    if top:
+        print("-" * 65)
+        print("TOP subnets (/24, >= 2 IPs):")
+        for t in top:
+            print(f"  {t['subnet']:<20} {t['ips']:>5,} IP | {t['alerts']:>7,} alerts (avg {t['avg']:,}/IP)")
     print("=" * 65)
+
+
+def cmd_spikes(conn: sqlite3.Connection):
+    rows = list(conn.execute(
+        "SELECT timestamp, start_time, end_time, total_alerts, avg_rate_per_min, unique_ips "
+        "FROM spike_events ORDER BY id"
+    ))
+    if not rows:
+        print("No anomaly spike events recorded.")
+        return
+    print(f"\n🚨 Anomaly spike events ({len(rows)} total)")
+    print("=" * 78)
+    print(f"{'When (UTC)':<21} | {'Window':<15} | {'Alerts':>8} | {'Rate/min':>9} | {'Uniq IP':>8}")
+    print("-" * 78)
+    for r in rows:
+        window = f"{r['start_time']}-{r['end_time']}"
+        print(f"{r['timestamp']:<21} | {window:<15} | {r['total_alerts']:>8,} | "
+              f"{r['avg_rate_per_min']:>9,} | {r['unique_ips']:>8,}")
+    print("=" * 78)
+
+
+def cmd_top(conn: sqlite3.Connection, n: int):
+    subnets = aggregate_seen_subnets(conn, min_ips=1)[:n]
+    print(f"\n🏆 Top {n} attacker subnets all-time (/24, by total hits)")
+    print("=" * 65)
+    print(f"{'Subnet':<22} | {'Unique IPs':>11} | {'Total hits':>11}")
+    print("-" * 65)
+    for net, uniq, hits in subnets:
+        print(f"{net:<22} | {uniq:>11,} | {hits:>11,}")
+    print("=" * 65)
+
+    ips = list(conn.execute(
+        "SELECT ip, total_hits FROM seen_ips ORDER BY total_hits DESC LIMIT ?", (n,)
+    ))
+    print(f"\n🏆 Top {n} attacker IPs all-time (by total hits)")
+    print("=" * 45)
+    print(f"{'IP':<32} | {'Total hits':>10}")
+    print("-" * 45)
+    for r in ips:
+        print(f"{r['ip']:<32} | {r['total_hits']:>10,}")
+    print("=" * 45)
 
 
 def sync_subnets_to_mikrotik(subnets_to_block: list[tuple[str, int, int]]):
@@ -152,12 +193,12 @@ def sync_subnets_to_mikrotik(subnets_to_block: list[tuple[str, int, int]]):
         print("Please edit /opt/alert-bridge/env with your router LAN IP and suricata API user password.", file=sys.stderr)
         return
     if not subnets_to_block:
-        print("\nNo subnets matched the threshold (>= 10 unique IPs) to sync to MikroTik.")
+        print("\nNo subnets matched the threshold to sync to MikroTik.")
         return
 
     print(f"\n🔄 Syncing {len(subnets_to_block)} subnets to MikroTik list '{block_list}'...")
 
-    for subnet_str, unique_cnt, total_alerts in subnets_to_block:
+    for subnet_str, unique_cnt, total_hits in subnets_to_block:
         try:
             net = ipaddress.ip_network(subnet_str, strict=False)
             family = "ipv6" if net.version == 6 else "ip"
@@ -168,14 +209,9 @@ def sync_subnets_to_mikrotik(subnets_to_block: list[tuple[str, int, int]]):
         base_url = f"https://{mt_host}/rest/{family}/firewall/address-list"
         auth = (mt_user, mt_pass)
 
-        # 1. Query existing address-list entries to remove single IPs covered by subnet
+        # 1. Remove single IPs covered by this subnet, plus any dynamic entry for the subnet itself
         try:
-            r_get = requests.get(
-                f"{base_url}?list={block_list}",
-                auth=auth,
-                verify=False,
-                timeout=(5, 10),
-            )
+            r_get = requests.get(f"{base_url}?list={block_list}", auth=auth, verify=False, timeout=(5, 10))
             if r_get.status_code == 200:
                 entries = r_get.json()
                 if isinstance(entries, list):
@@ -187,7 +223,7 @@ def sync_subnets_to_mikrotik(subnets_to_block: list[tuple[str, int, int]]):
                         try:
                             addr_obj = ipaddress.ip_address(addr)
                             if net and addr_obj in net:
-                                print(f"  🗑️ Removing redundant single IP {addr} (covered by subnet {subnet_str})...", flush=True)
+                                print(f"  🗑️ Removing redundant single IP {addr} (covered by {subnet_str})...", flush=True)
                                 requests.delete(f"{base_url}/{entry_id}", auth=auth, verify=False, timeout=(5, 10))
                         except ValueError:
                             if addr == subnet_str and (entry.get("timeout") or entry.get("dynamic") == "true"):
@@ -199,18 +235,12 @@ def sync_subnets_to_mikrotik(subnets_to_block: list[tuple[str, int, int]]):
         body = {
             "list": block_list,
             "address": subnet_str,
-            "comment": f"PERMANENT SUBNET ({unique_cnt} IPs, {total_alerts} hits)"[:60],
+            "comment": f"PERMANENT SUBNET ({unique_cnt} IPs, {total_hits} hits)"[:60],
         }
         try:
-            r_put = requests.put(
-                base_url,
-                json=body,
-                auth=auth,
-                verify=False,
-                timeout=(5, 15),
-            )
+            r_put = requests.put(base_url, json=body, auth=auth, verify=False, timeout=(5, 15))
             if r_put.status_code in (200, 201) or "already" in r_put.text:
-                print(f"  🔒 Blocked subnet {subnet_str} on MikroTik ({unique_cnt} IPs, {total_alerts} hits)", flush=True)
+                print(f"  🔒 Blocked subnet {subnet_str} ({unique_cnt} IPs, {total_hits} hits)", flush=True)
             else:
                 print(f"  ⚠️ Failed to block subnet {subnet_str}: {r_put.status_code} {r_put.text}", flush=True)
         except requests.RequestException as e:
@@ -218,65 +248,39 @@ def sync_subnets_to_mikrotik(subnets_to_block: list[tuple[str, int, int]]):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze Suricata alert bridge statistics by /24 subnets.")
-    parser.add_argument("--state-file", help="Path to state JSON file")
-    parser.add_argument("--min-ips", type=int, default=5, help="Minimum unique IPs per subnet to display (default: 5)")
-    parser.add_argument("--sum", "--total", "--journal", dest="sum", action="store_true", help="Read journalctl logs and total state files for complete historical summary")
-    parser.add_argument("--sync-mikrotik", "--block-subnets", action="store_true", help="Block subnets with >=10 unique IPs on MikroTik and remove redundant single IPs")
+    parser = argparse.ArgumentParser(description="Analyze Suricata alert-bridge SQLite statistics.")
+    parser.add_argument("--sum", "--total", action="store_true", help="Summary across every recorded day")
+    parser.add_argument("--day", metavar="YYYY-MM-DD", help="Full breakdown for one day")
+    parser.add_argument("--spikes", action="store_true", help="Log of all anomaly spike alerts")
+    parser.add_argument("--top", type=int, metavar="N", help="Top N attacker subnets and IPs all-time")
+    parser.add_argument("--min-ips", type=int, default=10, help="Min unique IPs per subnet for --sync-mikrotik (default: 10)")
+    parser.add_argument("--sync-mikrotik", "--block-subnets", action="store_true",
+                        help="Block /24 subnets with >= --min-ips unique IPs all-time on MikroTik")
     args = parser.parse_args()
 
-    inbound_counts = {}
+    conn = connect_db()
+    if conn is None:
+        sys.exit(1)
 
-    if args.sum:
-        # 1. Parse historical journalctl logs
-        days_data = parse_journal_logs()
-
-        # 2. Merge daily state file
-        daily_state = load_state_file(args.state_file or "/var/log/suricata/alert-bridge-state.json")
-        if daily_state and "date" in daily_state:
-            day = daily_state["date"]
-            for ip, cnt in daily_state.get("inbound_counts", {}).items():
-                days_data[day]["inbound"][ip] = max(days_data[day]["inbound"][ip], cnt)
-
-        # 3. Merge total state file
-        total_state = load_state_file("/var/log/suricata/alert-bridge-total-state.json")
-        total_inbound = defaultdict(int)
-
-        for day in sorted(days_data.keys()):
-            for ip, cnt in days_data[day]["inbound"].items():
-                total_inbound[ip] += cnt
-
-        for ip, cnt in total_state.get("inbound_counts", {}).items():
-            total_inbound[ip] = max(total_inbound[ip], cnt)
-
-        if not total_inbound:
-            print("No statistics found in journalctl or state files.")
-            return
-
-        sorted_days = sorted(days_data.keys())
-        period_str = f"Entire Period ({sorted_days[0]} .. {sorted_days[-1]})" if len(sorted_days) > 1 else f"Entire Period ({sorted_days[0]})" if sorted_days else "Entire Period"
-
-        inbound_agg = aggregate_subnet_24(total_inbound, min_ips=args.min_ips)
-        print_table(period_str, "Inbound Summary", inbound_agg)
-        inbound_counts = total_inbound
-
-    else:
-        state_path = args.state_file or "/var/log/suricata/alert-bridge-state.json"
-        state = load_state_file(state_path)
-        if not state or "date" not in state:
-            print(f"No statistics found in daily state file '{state_path}'.")
-            print("Tip: use --sum to read historical logs from journalctl.")
-            return
-
-        day = state["date"]
-        inbound_counts = state.get("inbound_counts", {})
-        inbound_agg = aggregate_subnet_24(inbound_counts, min_ips=args.min_ips)
-        print_table(f"Daily Stats ({day})", "Inbound", inbound_agg)
-    if args.sync_mikrotik:
-        # Filter subnets with >= 10 unique IPs (or args.min_ips if explicitly passed >= 10)
-        sync_min_ips = max(10, args.min_ips)
-        subnets_to_sync = aggregate_subnet_24(inbound_counts, min_ips=sync_min_ips)
-        sync_subnets_to_mikrotik(subnets_to_sync)
+    try:
+        did_something = False
+        if args.day:
+            cmd_day(conn, args.day)
+            did_something = True
+        if args.spikes:
+            cmd_spikes(conn)
+            did_something = True
+        if args.top:
+            cmd_top(conn, args.top)
+            did_something = True
+        if args.sync_mikrotik:
+            subnets = aggregate_seen_subnets(conn, min_ips=max(10, args.min_ips))
+            sync_subnets_to_mikrotik(subnets)
+            did_something = True
+        if args.sum or not did_something:
+            cmd_sum(conn)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

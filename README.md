@@ -5,8 +5,8 @@ Detection System that:
 
 - inspects a **live mirror of your WAN traffic** with [Suricata](https://suricata.io/) and ~50k free Emerging Threats Open signatures,
 - **automatically blocks attackers** on the router's firewall (with a self-expiring timeout),
-- sends the alerts that actually matter to your phone via **Telegram**,
-- and silently absorbs the internet's background noise (reputation-list hits) into a daily digest.
+- surfaces **anomaly spikes** to your phone via **Telegram** the moment attack volume crosses a threshold — no per-alert spam,
+- and rolls the rest into **fixed 6-hour digests** and a **07:00 daily report**, backed by a queryable **SQLite** history.
 
 This README is the step-by-step companion to the video tutorial. The three
 files in this repo — [`alert-bridge.py`](alert-bridge.py),
@@ -29,7 +29,7 @@ Internet ──▶ MikroTik router ──▶ your LAN (traffic flows normally)
                                                    ┌────┴────────┐
                                                    ▼             ▼
                                      MikroTik REST API      Telegram
-                                     (block attacker IP)   (notify you)
+                                     (block attacker IP)   (spikes + digests)
 ```
 
 Key design decisions:
@@ -41,10 +41,11 @@ Key design decisions:
   carries the mirror itself, or every packet spawns a copy of a copy of a
   copy — a packet fusion reactor. `filter-stream=yes` on the sniffer is the
   second layer of protection against this.
-- **Block loudly, notify quietly.** Reputation-list hits (`ET DROP`,
-  `ET CINS`, `ET TOR`) are blocked silently — they're weather, not news. Only
-  targeted scans, malware callbacks, and attack responses page your phone
-  (~5–8 messages a day instead of hundreds).
+- **Block everything, page rarely.** Every severity 1–2 hit is blocked, but
+  the bridge never sends a message per alert. It pages you only on an
+  **anomaly spike** (inbound alert rate over a 5-minute window crossing a
+  threshold), then summarizes the rest in scheduled digests — a handful of
+  messages a day instead of hundreds.
 
 ## Prerequisites
 
@@ -535,16 +536,18 @@ traffic you can explain — never traffic you're just tired of seeing.**
 ## Step 8 — The alert bridge: Telegram + auto-block
 
 One Python script closes the loop: it tails `eve.json`, and for every
-severity 1–2 alert it (a) pushes the attacker's IP into a MikroTik firewall
-address list via the REST API, and (b) sends a Telegram message — unless it's
-a reputation-list hit, which is blocked silently and counted into a daily
-digest.
+severity 1–2 alert it pushes the attacker's IP into a MikroTik firewall
+address list via the REST API. It never messages per alert — instead it
+records everything to a local SQLite database and pages Telegram only on an
+anomaly spike, a fixed 6-hour digest, or the 07:00 daily report (see
+[Step 8e](#8e-reports--analytics)).
 
 Install it from this repo:
 
 ```bash
 sudo mkdir /opt/alert-bridge/
 sudo curl -o /opt/alert-bridge/alert-bridge.py https://raw.githubusercontent.com/litle-dragon/suricata/main/alert-bridge.py
+sudo curl -o /opt/alert-bridge/analyze_stats.py https://raw.githubusercontent.com/litle-dragon/suricata/main/analyze_stats.py
 sudo curl -o /opt/alert-bridge/env https://raw.githubusercontent.com/litle-dragon/suricata/main/env.example
 sudo curl -o /etc/systemd/system/alert-bridge.service https://raw.githubusercontent.com/litle-dragon/suricata/main/alert-bridge.service
 sudo chmod 600 /opt/alert-bridge/env
@@ -652,16 +655,56 @@ Built-in safeguards:
   resolvers (1.1.1.1 / 8.8.8.8 / 9.9.9.9), and your own public IPs.
 - **Every block expires** — 1-hour timeout; false positives self-heal.
 - **Severity 1–2 only** — informational (severity 3) alerts are ignored.
-- **Rate-limited** — 5-minute cooldown per attacker+signature, so an nmap
-  scan is one message, not hundreds.
-- **Reputation hits stay quiet** — `ET DROP` / `ET CINS` / `ET TOR` are
-  blocked but only appear in the daily digest.
+- **Blocks are rate-limited** — a 5-minute cooldown per attacker+signature
+  keeps an nmap scan from hammering the router with duplicate REST calls.
+- **No per-alert paging** — Telegram fires only on an anomaly spike, a 6-hour
+  digest, or the 07:00 daily report; reputation hits (`ET DROP` / `ET CINS` /
+  `ET TOR`) are blocked but never page.
 
 > **If your LAN uses a different DNS resolver** (the router itself, an ISP
 > resolver, a local Pi-hole), add it to the `WHITELIST` in `alert-bridge.py`.
 > DNS-based malware rules fire on the *query*, so the "attacker" side of the
 > flow resolves to your resolver — without the whitelist entry, a single
 > severity-1 DNS alert would block your DNS for an hour.
+
+### 8e. Reports & analytics
+
+The bridge no longer sends a message per alert. Everything lands in a local
+SQLite database at `/var/log/suricata/alert_bridge.db` (WAL mode, created
+automatically on first run), and Telegram fires for only three things:
+
+| Notification | Trigger |
+|---|---|
+| 🚨 **Anomaly spike** | Inbound alert rate over a sliding 5-minute window crosses `SPIKE_THRESHOLD_N` (default 500). 15-minute cooldown between spikes. |
+| 📊 **6-hour digest** | Sent at each fixed clock slot — `00:00`, `06:00`, `12:00`, `18:00` — summarizing the slot that just ended. |
+| 🌅 **Daily report** | Sent once at 07:00 for the previous full day. |
+
+Tune the spike threshold in `/opt/alert-bridge/env`. To find a sensible `N`
+for your network, watch your own background rate first:
+
+```bash
+# inbound alerts in the last 24h (divide by minutes to estimate the peak rate)
+journalctl -u alert-bridge --since "24 hours ago" | grep -c "inbound-alert"
+```
+
+Set it above your normal background so only real floods page you:
+
+```
+SPIKE_THRESHOLD_N=500
+```
+
+Query the history any time with `analyze_stats.py` — it reads the SQLite
+database directly, no log parsing:
+
+```bash
+sudo python3 /opt/alert-bridge/analyze_stats.py --sum              # every recorded day
+sudo python3 /opt/alert-bridge/analyze_stats.py --day 2026-08-05   # one day, full breakdown
+sudo python3 /opt/alert-bridge/analyze_stats.py --spikes           # anomaly spike log
+sudo python3 /opt/alert-bridge/analyze_stats.py --top 20           # top attacker subnets + IPs all-time
+```
+
+`--sync-mikrotik` still works, now sourced from the all-time attacker history:
+it permanently blocks any `/24` with `--min-ips` (default 10) unique attackers.
 
 ## Step 9 — Prove the whole loop
 
@@ -789,8 +832,8 @@ sudo tail -f /var/log/suricata/eve.json | jq -c 'select(.event_type=="alert") | 
 
 | File | Purpose |
 |---|---|
-| [`alert-bridge.py`](alert-bridge.py) | Tails `eve.json`, blocks attackers via the MikroTik REST API, notifies via Telegram |
+| [`alert-bridge.py`](alert-bridge.py) | Tails `eve.json`, blocks attackers via the MikroTik REST API, records to SQLite, and pages Telegram on spikes/digests |
 | [`alert-bridge.service`](alert-bridge.service) | systemd unit for the bridge |
-| [`sync-state-from-journal.py`](sync-state-from-journal.py) | Restores/syncs state file from `journalctl` logs |
-| [`analyze_stats.py`](analyze_stats.py) | Aggregates daily attacker/target statistics grouped by `/24` subnet |
+| [`analyze_stats.py`](analyze_stats.py) | Queries the SQLite database — daily summaries, spike log, top attackers (`--sum` / `--day` / `--spikes` / `--top`) |
+| [`sync-state-from-journal.py`](sync-state-from-journal.py) | Legacy — rebuilt the old JSON state from `journalctl`; unused since the SQLite migration |
 | [`env.example`](env.example) | Configuration template → copy to `/opt/alert-bridge/env` |
