@@ -836,4 +836,5 @@ sudo tail -f /var/log/suricata/eve.json | jq -c 'select(.event_type=="alert") | 
 | [`alert-bridge.service`](alert-bridge.service) | systemd unit for the bridge |
 | [`analyze_stats.py`](analyze_stats.py) | Queries the SQLite database — daily summaries, spike log, top attackers (`--sum` / `--day` / `--spikes` / `--top`) |
 | [`sync-state-from-journal.py`](sync-state-from-journal.py) | Legacy — rebuilt the old JSON state from `journalctl`; unused since the SQLite migration |
+| [`migrate_json_to_sqlite.py`](migrate_json_to_sqlite.py) | One-time — seeds SQLite `seen_ips`/`seen_subnets` from the legacy JSON state so day one isn't all "new" |
 | [`env.example`](env.example) | Configuration template → copy to `/opt/alert-bridge/env` |
