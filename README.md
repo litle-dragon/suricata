@@ -660,6 +660,16 @@ Built-in safeguards:
 - **No per-alert paging** — Telegram fires only on an anomaly spike, a 6-hour
   digest, or the 07:00 daily report; reputation hits (`ET DROP` / `ET CINS` /
   `ET TOR`) are blocked but never page.
+- **Subnet blocks use all-time uniqueness, not a daily window** — a `/24`
+  reaching 10 distinct attacker IPs gets permanently blocked, even if those
+  hits are spread across several days (not reset at midnight).
+- **Every permanent block is audited** — a `permanent_blocks` table records
+  every IP/subnet that ever got a permanent block and when, so
+  `analyze_stats.py --list` can show the real addresses, not just a count.
+- **State reconciled against the router, not just assumed** — once an IP's
+  attempt count passes the permanent threshold, the bridge verifies against
+  MikroTik's real block list before treating it as already-handled; a
+  6-hour, end-of-slot pass catches anything a failed REST call missed.
 
 > **If your LAN uses a different DNS resolver** (the router itself, an ISP
 > resolver, a local Pi-hole), add it to the `WHITELIST` in `alert-bridge.py`.
@@ -703,8 +713,25 @@ sudo python3 /opt/alert-bridge/analyze_stats.py --spikes           # anomaly spi
 sudo python3 /opt/alert-bridge/analyze_stats.py --top 20           # top attacker subnets + IPs all-time
 ```
 
+Add `--list` to `--sum`/`--day` to print the actual addresses (new IPs, new
+subnets, and anything permanently blocked that day) instead of just counts.
+Large days get a 50-per-group terminal preview — pass `--list-out FILE` to
+write the full, untruncated lists to a file instead:
+
+```bash
+sudo python3 /opt/alert-bridge/analyze_stats.py --day 2026-08-05 --list
+sudo python3 /opt/alert-bridge/analyze_stats.py --day 2026-08-05 --list --list-out /tmp/2026-08-05.txt
+```
+
 `--sync-mikrotik` still works, now sourced from the all-time attacker history:
 it permanently blocks any `/24` with `--min-ips` (default 10) unique attackers.
+
+Once several adjacent `/24`s have been blocked, collapse them into wider
+CIDRs directly on the router (e.g. two neighboring `/24`s become one `/23`):
+
+```bash
+sudo python3 /opt/alert-bridge/analyze_stats.py --merge-adjacent
+```
 
 ## Step 9 — Prove the whole loop
 
@@ -834,7 +861,7 @@ sudo tail -f /var/log/suricata/eve.json | jq -c 'select(.event_type=="alert") | 
 |---|---|
 | [`alert-bridge.py`](alert-bridge.py) | Tails `eve.json`, blocks attackers via the MikroTik REST API, records to SQLite, and pages Telegram on spikes/digests |
 | [`alert-bridge.service`](alert-bridge.service) | systemd unit for the bridge |
-| [`analyze_stats.py`](analyze_stats.py) | Queries the SQLite database — daily summaries, spike log, top attackers (`--sum` / `--day` / `--spikes` / `--top`) |
+| [`analyze_stats.py`](analyze_stats.py) | Queries the SQLite database — daily summaries, spike log, top attackers, real addresses, subnet cleanup (`--sum` / `--day` / `--spikes` / `--top` / `--list` / `--list-out` / `--sync-mikrotik` / `--merge-adjacent`) |
 | [`sync-state-from-journal.py`](sync-state-from-journal.py) | Legacy — rebuilt the old JSON state from `journalctl`; unused since the SQLite migration |
 | [`migrate_json_to_sqlite.py`](migrate_json_to_sqlite.py) | One-time — seeds SQLite `seen_ips`/`seen_subnets` from the legacy JSON state so day one isn't all "new" |
 | [`env.example`](env.example) | Configuration template → copy to `/opt/alert-bridge/env` |

@@ -6,7 +6,12 @@ Reads /var/log/suricata/alert_bridge.db directly (no journal parsing):
   --day YYYY-MM-DD      Full breakdown for one historical day.
   --spikes              Log of all anomaly spike alerts (spike_events).
   --top N               Top N attacker subnets and IPs all-time (seen_subnets / seen_ips).
+  --list                With --sum/--day: also print actual new-IP/new-subnet/permanently-blocked
+                        addresses (not just counts). Terminal preview is capped per group.
+  --list-out FILE       With --list: write the full, untruncated address lists to FILE.
   --sync-mikrotik       Block /24 subnets with >= MIN unique IPs all-time on MikroTik.
+  --merge-adjacent      Collapse adjacent /24 entries on the live MikroTik block list into
+                        wider CIDRs (e.g. two neighboring /24s -> one /23).
 
 With no mode given, prints the --sum summary.
 """
@@ -103,12 +108,29 @@ def _permanent_blocks_for_day(conn: sqlite3.Connection, day: str) -> list[tuple[
     return [(r["ip_or_subnet"], r["kind"]) for r in rows]
 
 
-def _print_day_addresses(conn: sqlite3.Connection, day: str, indent: str = "") -> None:
+LIST_PREVIEW_LIMIT = 50  # terminal preview cap per address group; full list goes to --list-out
+
+
+def _print_address_block(label: str, addresses: list[str], indent: str = "", out_fh=None) -> None:
+    """One address per line (not a giant comma-joined line) with a preview
+    cap for the terminal; the full list goes to `out_fh` when given."""
+    print(f"{indent}{label} ({len(addresses)}):")
+    for addr in addresses[:LIST_PREVIEW_LIMIT]:
+        print(f"{indent}  {addr}")
+    if len(addresses) > LIST_PREVIEW_LIMIT:
+        print(f"{indent}  ...і ще {len(addresses) - LIST_PREVIEW_LIMIT} "
+              f"(використай --list-out FILE для повного списку)")
+    if out_fh is not None:
+        out_fh.write(f"# {label} ({len(addresses)})\n")
+        out_fh.write("\n".join(addresses) + "\n\n")
+
+
+def _print_day_addresses(conn: sqlite3.Connection, day: str, indent: str = "", out_fh=None) -> None:
     ips, subnets = _new_addresses_for_day(conn, day)
     if ips:
-        print(f"{indent}Нові IP ({len(ips)}): {', '.join(ips)}")
+        _print_address_block("Нові IP", ips, indent, out_fh)
     if subnets:
-        print(f"{indent}Нові підмережі ({len(subnets)}): {', '.join(subnets)}")
+        _print_address_block("Нові підмережі", subnets, indent, out_fh)
 
     perm = _permanent_blocks_for_day(conn, day)
     if perm is None:
@@ -118,14 +140,14 @@ def _print_day_addresses(conn: sqlite3.Connection, day: str, indent: str = "") -
     perm_ips = [a for a, k in perm if k == "ip"]
     perm_subnets = [a for a, k in perm if k == "subnet"]
     if perm_ips:
-        print(f"{indent}Заблоковано постійно, IP ({len(perm_ips)}): {', '.join(perm_ips)}")
+        _print_address_block("Заблоковано постійно, IP", perm_ips, indent, out_fh)
     if perm_subnets:
-        print(f"{indent}Заблоковано постійно, підмережі ({len(perm_subnets)}): {', '.join(perm_subnets)}")
+        _print_address_block("Заблоковано постійно, підмережі", perm_subnets, indent, out_fh)
     if not perm:
         print(f"{indent}Заблоковано постійно цього дня: 0")
 
 
-def cmd_sum(conn: sqlite3.Connection, show_list: bool = False):
+def cmd_sum(conn: sqlite3.Connection, show_list: bool = False, out_fh=None):
     rows = list(conn.execute(
         "SELECT date, total_alerts, unique_ips, unique_subnets, new_ips_count, "
         "new_subnets_count, perm_ips_count, perm_subnets_count FROM daily_stats ORDER BY date"
@@ -145,7 +167,7 @@ def cmd_sum(conn: sqlite3.Connection, show_list: bool = False):
               f"{r['new_ips_count']:>9,} | {r['unique_subnets']:>9,} | {r['new_subnets_count']:>8,} | "
               f"{r['perm_ips_count']:>7,} | {r['perm_subnets_count']:>7,}")
         if show_list:
-            _print_day_addresses(conn, r["date"], indent="    ")
+            _print_day_addresses(conn, r["date"], indent="    ", out_fh=out_fh)
         tot_alerts += r["total_alerts"]
         tot_new_ips += r["new_ips_count"]
         tot_new_nets += r["new_subnets_count"]
@@ -157,7 +179,7 @@ def cmd_sum(conn: sqlite3.Connection, show_list: bool = False):
     print("=" * 92)
 
 
-def cmd_day(conn: sqlite3.Connection, day: str, show_list: bool = False):
+def cmd_day(conn: sqlite3.Connection, day: str, show_list: bool = False, out_fh=None):
     r = conn.execute("SELECT * FROM daily_stats WHERE date=?", (day,)).fetchone()
     if not r:
         print(f"No record for {day}. Available days: use --sum to list.")
@@ -177,7 +199,7 @@ def cmd_day(conn: sqlite3.Connection, day: str, show_list: bool = False):
     print(f"• Single (non-aggregated):   {r['single_ips_count']:,} IPs ({r['single_ips_alerts']:,} alerts)")
     if show_list:
         print("-" * 65)
-        _print_day_addresses(conn, day)
+        _print_day_addresses(conn, day, out_fh=out_fh)
     if top:
         print("-" * 65)
         print("TOP subnets (/24, >= 2 IPs):")
@@ -408,7 +430,10 @@ def main():
     parser.add_argument("--spikes", action="store_true", help="Log of all anomaly spike alerts")
     parser.add_argument("--top", type=int, metavar="N", help="Top N attacker subnets and IPs all-time")
     parser.add_argument("--list", action="store_true",
-                        help="With --sum/--day: also print actual new-IP/new-subnet addresses, not just counts")
+                        help="With --sum/--day: also print actual new-IP/new-subnet/permanently-blocked "
+                             f"addresses, not just counts (terminal preview capped at {LIST_PREVIEW_LIMIT}/group)")
+    parser.add_argument("--list-out", metavar="FILE",
+                        help="With --list: write the FULL address lists to FILE instead of truncating them")
     parser.add_argument("--min-ips", type=int, default=10, help="Min unique IPs per subnet for --sync-mikrotik (default: 10)")
     parser.add_argument("--sync-mikrotik", "--block-subnets", action="store_true",
                         help="Block /24 subnets with >= --min-ips unique IPs all-time on MikroTik")
@@ -420,10 +445,15 @@ def main():
     if conn is None:
         sys.exit(1)
 
+    out_fh = None
     try:
+        if args.list_out:
+            out_fh = open(args.list_out, "w")
+            print(f"Full address lists also being written to {args.list_out}")
+
         did_something = False
         if args.day:
-            cmd_day(conn, args.day, show_list=args.list)
+            cmd_day(conn, args.day, show_list=args.list, out_fh=out_fh)
             did_something = True
         if args.spikes:
             cmd_spikes(conn)
@@ -439,9 +469,11 @@ def main():
             merge_adjacent_subnets()
             did_something = True
         if args.sum or not did_something:
-            cmd_sum(conn, show_list=args.list)
+            cmd_sum(conn, show_list=args.list, out_fh=out_fh)
     finally:
         conn.close()
+        if out_fh:
+            out_fh.close()
 
 
 if __name__ == "__main__":
