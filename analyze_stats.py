@@ -90,14 +90,39 @@ def _new_addresses_for_day(conn: sqlite3.Connection, day: str) -> tuple[list[str
     return ips, subnets
 
 
+def _permanent_blocks_for_day(conn: sqlite3.Connection, day: str) -> list[tuple[str, str]] | None:
+    """(ip_or_subnet, kind) permanently blocked on `day`. None if the audit
+    table doesn't exist yet (DB predates the permanent_blocks migration)."""
+    try:
+        rows = conn.execute(
+            "SELECT ip_or_subnet, kind FROM permanent_blocks WHERE date(blocked_at)=? ORDER BY blocked_at",
+            (day,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    return [(r["ip_or_subnet"], r["kind"]) for r in rows]
+
+
 def _print_day_addresses(conn: sqlite3.Connection, day: str, indent: str = "") -> None:
     ips, subnets = _new_addresses_for_day(conn, day)
     if ips:
         print(f"{indent}Нові IP ({len(ips)}): {', '.join(ips)}")
     if subnets:
         print(f"{indent}Нові підмережі ({len(subnets)}): {', '.join(subnets)}")
-    print(f"{indent}(адреси постійно заблокованих IP/підмереж за день окремо не зберігаються — "
-          f"лише лічильник perm_ips_count/perm_subnets_count)")
+
+    perm = _permanent_blocks_for_day(conn, day)
+    if perm is None:
+        print(f"{indent}(таблиця permanent_blocks відсутня в цій базі — оновлений alert-bridge.py "
+              f"ще не запускався тут; лічильники perm_ips_count/perm_subnets_count є, адрес нема)")
+        return
+    perm_ips = [a for a, k in perm if k == "ip"]
+    perm_subnets = [a for a, k in perm if k == "subnet"]
+    if perm_ips:
+        print(f"{indent}Заблоковано постійно, IP ({len(perm_ips)}): {', '.join(perm_ips)}")
+    if perm_subnets:
+        print(f"{indent}Заблоковано постійно, підмережі ({len(perm_subnets)}): {', '.join(perm_subnets)}")
+    if not perm:
+        print(f"{indent}Заблоковано постійно цього дня: 0")
 
 
 def cmd_sum(conn: sqlite3.Connection, show_list: bool = False):
