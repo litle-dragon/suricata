@@ -160,12 +160,28 @@ CREATE TABLE IF NOT EXISTS spike_events (
     unique_ips INTEGER NOT NULL,
     top_subnets_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS permanent_blocks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip_or_subnet TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    signature TEXT,
+    blocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_permanent_blocks_addr ON permanent_blocks(ip_or_subnet);
 """
 
 # ── In-memory hot state ───────────────────────────────────────────────────────
 # All-time uniqueness caches (mirror of seen_ips / seen_subnets, loaded at startup)
 _all_time_seen_ips: set[str] = set()
 _all_time_seen_subnets: set[str] = set()
+# All-time membership: subnet -> set of every unique attacker IP ever seen in it
+# (drives the subnet block threshold on all-time data, not just today's window)
+_all_time_subnet_ips: dict[str, set[str]] = defaultdict(set)
+# Audit of everything currently permanently blocked (mirror of permanent_blocks table,
+# loaded at startup) — lets every threshold check skip re-blocking/re-querying MikroTik
+# for addresses we already know are permanently in the list.
+_permanently_blocked_ips: set[str] = set()
+_permanently_blocked_subnets: set[str] = set()
 
 # 5-minute sliding window for anomaly detection
 _sliding_window_alerts: list[dict] = []   # {"time": float, "ip": str, "sig": str, "direction": str}
@@ -197,6 +213,7 @@ _last_7am_report_date = ""
 def db_init() -> None:
     """Open the SQLite database (WAL mode), create tables, and warm uniqueness caches."""
     global _conn, _all_time_seen_ips, _all_time_seen_subnets
+    global _all_time_subnet_ips, _permanently_blocked_ips, _permanently_blocked_subnets
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     _conn = sqlite3.connect(DB_FILE, isolation_level=None)  # autocommit
     _conn.execute("PRAGMA journal_mode=WAL;")
@@ -204,8 +221,26 @@ def db_init() -> None:
     _conn.executescript(SCHEMA)
     _all_time_seen_ips = {row[0] for row in _conn.execute("SELECT ip FROM seen_ips")}
     _all_time_seen_subnets = {row[0] for row in _conn.execute("SELECT subnet FROM seen_subnets")}
+    _all_time_subnet_ips = defaultdict(set)
+    for ip in _all_time_seen_ips:
+        _all_time_subnet_ips[get_subnet(ip)].add(ip)
+    _permanently_blocked_ips = {
+        row[0] for row in _conn.execute("SELECT ip_or_subnet FROM permanent_blocks WHERE kind='ip'")
+    }
+    _permanently_blocked_subnets = {
+        row[0] for row in _conn.execute("SELECT ip_or_subnet FROM permanent_blocks WHERE kind='subnet'")
+    }
     print(f"opened {DB_FILE}: {len(_all_time_seen_ips)} known IPs, "
-          f"{len(_all_time_seen_subnets)} known subnets", flush=True)
+          f"{len(_all_time_seen_subnets)} known subnets, "
+          f"{len(_permanently_blocked_ips)} perm IPs, {len(_permanently_blocked_subnets)} perm subnets",
+          flush=True)
+
+
+def db_record_permanent_block(addr: str, kind: str, sig: str) -> None:
+    _conn.execute(
+        "INSERT OR IGNORE INTO permanent_blocks(ip_or_subnet, kind, signature) VALUES(?,?,?)",
+        (addr, kind, sig),
+    )
 
 
 def db_seen_ip(ip: str, is_new: bool) -> None:
@@ -240,8 +275,9 @@ def get_subnet(ip: str) -> str:
 def record_hit(direction: str, ip: str, sig: str) -> tuple[int, str, int]:
     """
     Records an inbound/outbound hit against slot + daily counters and updates
-    all-time uniqueness (seen_ips / seen_subnets) for inbound attackers.
-    Returns: (ip_daily_count, subnet_str, subnet_daily_unique_count)
+    all-time uniqueness (seen_ips / seen_subnets / _all_time_subnet_ips) for
+    inbound attackers.
+    Returns: (ip_daily_count, subnet_str, subnet_alltime_unique_count)
     """
     subnet_str = get_subnet(ip)
 
@@ -257,6 +293,7 @@ def record_hit(direction: str, ip: str, sig: str) -> tuple[int, str, int]:
         _all_time_seen_ips.add(ip)
         _slot_new_ips.add(ip)
         _daily_new_ips.add(ip)
+    _all_time_subnet_ips[subnet_str].add(ip)
     db_seen_ip(ip, is_new_ip)
 
     is_new_subnet = subnet_str not in _all_time_seen_subnets
@@ -273,15 +310,16 @@ def record_hit(direction: str, ip: str, sig: str) -> tuple[int, str, int]:
     s_slot["ips"].add(ip)
     s_slot["alerts"] += 1
 
-    # Daily counters (drive block thresholds + midnight snapshot)
+    # Daily counters (drive digest reporting + midnight snapshot; block thresholds
+    # now read _all_time_subnet_ips instead, see main())
     _daily_inbound_counts[ip] = _daily_inbound_counts.get(ip, 0) + 1
     ip_daily_count = _daily_inbound_counts[ip]
     s_daily = _daily_inbound_subnets.setdefault(subnet_str, {"ips": set(), "alerts": 0})
     s_daily["ips"].add(ip)
     s_daily["alerts"] += 1
-    subnet_daily_unique_cnt = len(s_daily["ips"])
 
-    return ip_daily_count, subnet_str, subnet_daily_unique_cnt
+    subnet_alltime_unique_cnt = len(_all_time_subnet_ips[subnet_str])
+    return ip_daily_count, subnet_str, subnet_alltime_unique_cnt
 
 
 def whitelisted(ip: str) -> bool:
@@ -341,6 +379,45 @@ def telegram_send(text: str) -> None:
         )
     except requests.RequestException as e:
         print(f"telegram failed: {e}", flush=True)
+
+
+def mikrotik_lookup_covered(ip: str) -> str:
+    """
+    Queries the live MikroTik block list for `ip`.
+    Returns "ip" if the exact address is listed, "subnet" if a covering
+    subnet is listed, or "absent" if neither is present — including on a
+    failed/unreadable query, so the caller re-adds rather than trusting
+    stale local state.
+    """
+    try:
+        net = ipaddress.ip_network(ip, strict=False)
+        family = "ipv6" if net.version == 6 else "ip"
+        ip_addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return "absent"
+    base_url = f"https://{MT_HOST}/rest/{family}/firewall/address-list"
+    auth = (MT_USER, MT_PASS)
+    try:
+        r = requests.get(f"{base_url}?list={BLOCK_LIST}", auth=auth, verify=False, timeout=(5, 10))
+        if r.status_code != 200:
+            return "absent"
+        entries = r.json()
+        if not isinstance(entries, list):
+            return "absent"
+        for entry in entries:
+            addr = entry.get("address", "")
+            if addr == ip:
+                return "ip"
+            try:
+                addr_net = ipaddress.ip_network(addr, strict=False)
+            except ValueError:
+                continue
+            if addr_net.prefixlen < addr_net.max_prefixlen and ip_addr in addr_net:
+                return "subnet"
+        return "absent"
+    except requests.RequestException as e:
+        print(f"mikrotik lookup failed for {ip}: {e}", flush=True)
+        return "absent"
 
 
 def mikrotik_block(ip_or_subnet: str, signature: str, permanent: bool = False) -> bool:
@@ -429,12 +506,24 @@ def _top_and_singles(subnets: dict) -> tuple[list[dict], int, int]:
 
 
 def _format_top_lines(top: list[dict]) -> list[str]:
+    """
+    ТОП by alert volume, not by what actually got blocked — a subnet can be
+    #1 here from cooldown-skipped or MikroTik-failed hits with zero real
+    blocks. 🔒 marks subnets that are (as of now) actually permanently
+    blocked, via the same all-time audit set the block logic itself uses.
+    """
     lines = ["ТОП10 підмереж по алертам (/24, від 2+ IP):"]
+    any_blocked = False
     for t in top:
+        blocked = t["subnet"] in _permanently_blocked_subnets
+        any_blocked = any_blocked or blocked
+        mark = " 🔒" if blocked else ""
         lines.append(
             f"• {t['subnet']} — {t['ips']:,} IP | {t['alerts']:,} алертів "
-            f"(сер. {t['avg']:,} алерти/IP)"
+            f"(сер. {t['avg']:,} алерти/IP){mark}"
         )
+    if any_blocked:
+        lines.append("(🔒 = підмережа вже заблокована постійно)")
     return lines
 
 
@@ -629,6 +718,40 @@ def check_spike(now: float) -> None:
         _last_spike_alert_time = now
 
 
+def reconcile_slot_blocks() -> None:
+    """
+    Safety net run right before a slot's counters are wiped: catches any IP or
+    subnet that crossed its permanent-block threshold during the slot but
+    never actually got blocked (a failed MikroTik call, a race with the live
+    per-alert check). Reuses the same audit sets the live path maintains, so
+    anything already blocked is a no-op here.
+    """
+    global _daily_permanent_ips_count, _daily_permanent_subnets_count
+    for ip, cnt in _slot_inbound_counts.items():
+        if cnt < PERMANENT_THRESHOLD or ip in _permanently_blocked_ips:
+            continue
+        subnet_str = get_subnet(ip)
+        if subnet_str in _permanently_blocked_subnets:
+            continue
+        blocked = mikrotik_block(ip, f"SLOT RECONCILE ({cnt} hits)", permanent=True)
+        if blocked:
+            _permanently_blocked_ips.add(ip)
+            db_record_permanent_block(ip, "ip", "slot-reconcile")
+            _daily_permanent_ips_count += 1
+        print(f"slot-reconcile ip={ip} hits={cnt} blocked={blocked}", flush=True)
+
+    for subnet_str, info in _slot_inbound_subnets.items():
+        unique_ips = len(info["ips"])
+        if unique_ips < SUBNET_THRESHOLD or subnet_str in _permanently_blocked_subnets:
+            continue
+        blocked = mikrotik_block(subnet_str, f"SLOT RECONCILE ({unique_ips} IPs)", permanent=True)
+        if blocked:
+            _permanently_blocked_subnets.add(subnet_str)
+            db_record_permanent_block(subnet_str, "subnet", "slot-reconcile")
+            _daily_permanent_subnets_count += 1
+        print(f"slot-reconcile subnet={subnet_str} unique_ips={unique_ips} blocked={blocked}", flush=True)
+
+
 def check_periodic_tasks() -> None:
     global _last_7am_report_date
     now = time.time()
@@ -641,9 +764,11 @@ def check_periodic_tasks() -> None:
     while _sliding_window_alerts and _sliding_window_alerts[0]["time"] < cutoff:
         _sliding_window_alerts.pop(0)
 
-    # 1. 6-hour slot boundary: emit digest for the completed slot, then reset
+    # 1. 6-hour slot boundary: emit digest for the completed slot, reconcile
+    #    any missed permanent blocks against the slot's own data, then reset
     if cur_slot != _slot_index:
         send_6h_slot_digest(_slot_index, _digest_day)
+        reconcile_slot_blocks()
         _reset_slot_state(cur_slot)
 
     # 2. Midnight rollover: archive the completed day, then reset daily counters
@@ -711,7 +836,7 @@ def main() -> None:
         now = time.time()
 
         if direction == "inbound":
-            attempts, subnet_str, subnet_unique_cnt = record_hit("inbound", target_ip, sig)
+            attempts, subnet_str, subnet_alltime_cnt = record_hit("inbound", target_ip, sig)
 
             # Feed anomaly detection with every inbound alert (rate, not per-alert paging)
             _sliding_window_alerts.append(
@@ -719,16 +844,43 @@ def main() -> None:
             )
             check_spike(now)
 
-            # Subnet aggregation: block entire /24 once 10 unique IPs reached today
-            if subnet_unique_cnt == SUBNET_THRESHOLD:
-                blocked_sub = mikrotik_block(subnet_str, f"SUBNET BLOCK (10+ IPs): {sig}", permanent=True)
+            # Subnet aggregation: block entire /24 once >= SUBNET_THRESHOLD unique IPs
+            # reached all-time (not reset daily). Checked on every alert in that subnet,
+            # gated by _permanently_blocked_subnets so an already-blocked subnet is a
+            # no-op instead of a repeat REST call — and a prior failed attempt retries
+            # on the very next alert instead of waiting for the count to tick again.
+            if subnet_str not in _permanently_blocked_subnets and subnet_alltime_cnt >= SUBNET_THRESHOLD:
+                blocked_sub = mikrotik_block(
+                    subnet_str, f"SUBNET BLOCK ({subnet_alltime_cnt}+ IPs all-time): {sig}", permanent=True
+                )
                 if blocked_sub:
+                    _permanently_blocked_subnets.add(subnet_str)
+                    db_record_permanent_block(subnet_str, "subnet", sig)
                     _slot_perm_subnets_count += 1
                     _daily_permanent_subnets_count += 1
-                print(f"subnet-block {sig} subnet={subnet_str} unique_ips={subnet_unique_cnt} "
+                print(f"subnet-block {sig} subnet={subnet_str} unique_ips={subnet_alltime_cnt} "
                       f"permanent=True blocked={blocked_sub}", flush=True)
 
             if attempts > PERMANENT_THRESHOLD:
+                # Fast path: we already know this IP or its subnet is permanently blocked.
+                if target_ip in _permanently_blocked_ips or subnet_str in _permanently_blocked_subnets:
+                    continue
+                # Local state disagrees with the attempt count — verify against the
+                # router directly rather than assume a stale/missing local record.
+                state = mikrotik_lookup_covered(target_ip)
+                if state == "ip":
+                    _permanently_blocked_ips.add(target_ip)
+                elif state == "subnet":
+                    _permanently_blocked_subnets.add(subnet_str)
+                else:
+                    blocked_retry = mikrotik_block(target_ip, f"RETRY BLOCK (attempts={attempts}): {sig}", permanent=True)
+                    if blocked_retry:
+                        _permanently_blocked_ips.add(target_ip)
+                        db_record_permanent_block(target_ip, "ip", sig)
+                        _slot_perm_ips_count += 1
+                        _daily_permanent_ips_count += 1
+                    print(f"inbound-alert {sig} attacker={target_ip} attempts={attempts} "
+                          f"not-on-router blocked={blocked_retry}", flush=True)
                 continue
 
             permanent = (attempts == PERMANENT_THRESHOLD)
@@ -738,6 +890,8 @@ def main() -> None:
 
             blocked = mikrotik_block(target_ip, sig, permanent=permanent)
             if permanent and blocked:
+                _permanently_blocked_ips.add(target_ip)
+                db_record_permanent_block(target_ip, "ip", sig)
                 _slot_perm_ips_count += 1
                 _daily_permanent_ips_count += 1
 
