@@ -1104,13 +1104,23 @@ def main() -> None:
                     print(f"subnet-block {sig} subnet={subnet_str} unique_ips={subnet_alltime_cnt} "
                           f"permanent=True blocked={blocked_sub}", flush=True)
 
-                if attempts > PERMANENT_THRESHOLD:
-                    # Fast path: we already know this IP or its subnet is permanently blocked.
-                    if target_ip in _permanently_blocked_ips:
-                        continue
-                    if subnet_str in _permanently_blocked_subnets:
+                # Once the whole subnet is permanently blocked, no individual IP
+                # inside it ever needs its own entry — temp (attempts 1-2) or
+                # permanent (attempts == PERMANENT_THRESHOLD) alike. Checked before
+                # any per-IP branch below, so this covers every attempt count, not
+                # just the threshold-crossing moment. Print is cooldown-gated (not
+                # per-alert) since every future alert from anywhere in an
+                # already-blocked /24 would otherwise hit this every single time.
+                if subnet_str in _permanently_blocked_subnets:
+                    if cooled_down(f"subnet-skip|{subnet_str}"):
                         print(f"inbound-alert {sig} attacker={target_ip} attempts={attempts} "
                               f"skip: subnet {subnet_str} already permanently blocked", flush=True)
+                    continue
+
+                if attempts > PERMANENT_THRESHOLD:
+                    # Fast path: we already know this IP is permanently blocked
+                    # (subnet case is handled by the check above).
+                    if target_ip in _permanently_blocked_ips:
                         continue
                     # Local state disagrees with the attempt count — verify against the
                     # router directly rather than assume a stale/missing local record.
@@ -1135,15 +1145,6 @@ def main() -> None:
                     continue
 
                 permanent = (attempts == PERMANENT_THRESHOLD)
-
-                # Same subnet-already-blocked check the attempts>PERMANENT_THRESHOLD
-                # fast path and reconcile_slot_blocks() already apply — without it,
-                # the very first threshold-crossing hit for an IP inside an already
-                # permanently-blocked subnet would still create a redundant /32 entry.
-                if permanent and subnet_str in _permanently_blocked_subnets:
-                    print(f"inbound-alert {sig} attacker={target_ip} attempts={attempts} "
-                          f"skip: subnet {subnet_str} already permanently blocked", flush=True)
-                    continue
 
                 if not permanent and not cooled_down(f"inbound|{target_ip}|{alert.get('signature_id')}"):
                     continue
