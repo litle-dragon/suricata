@@ -506,6 +506,15 @@ def sync_subnets_to_mikrotik(conn: sqlite3.Connection, subnets_to_block: list[tu
     scratch. Redundant single-IP cleanup for that subnet still runs — new
     per-IP temporary blocks from alert-bridge.py's own 1h-timeout path can
     still land inside an already-blocked subnet's range between syncs.
+
+    Fetches the live block list ONCE per address family (cached), not once
+    per subnet: the prior version re-fetched the *entire* address-list for
+    every subnet in the loop, so a run over N subnets meant N full-table GETs
+    back to back — the likely cause of the "Read timed out" storm seen on a
+    59-subnet run against a real router. Every failure mode is now counted
+    in the closing summary — a query timeout used to only print a Warning
+    line and vanish from the final tally, showing "0 failed" while the log
+    above it was full of timeouts.
     """
     if requests is None:
         print("\nError: 'requests' library not installed. Install with: sudo apt install python3-requests", file=sys.stderr)
@@ -527,6 +536,29 @@ def sync_subnets_to_mikrotik(conn: sqlite3.Connection, subnets_to_block: list[tu
         return
 
     already_blocked = _permanently_blocked_subnet_set(conn)
+    auth = (mt_user, mt_pass)
+
+    # Fetch the live block list once per family (ip / ipv6), cached — see
+    # docstring. `None` in the cache means "fetch failed", distinct from an
+    # empty (but successfully fetched) list.
+    list_cache: dict[str, list | None] = {}
+
+    def fetch_list_once(family: str) -> list | None:
+        if family in list_cache:
+            return list_cache[family]
+        url = f"https://{mt_host}/rest/{family}/firewall/address-list"
+        try:
+            r = requests.get(f"{url}?list={block_list}", auth=auth, verify=False, timeout=(5, 20))
+            if r.status_code == 200:
+                data = r.json()
+                list_cache[family] = data if isinstance(data, list) else []
+            else:
+                print(f"  Warning: failed to fetch MikroTik {family} block list: HTTP {r.status_code}", file=sys.stderr)
+                list_cache[family] = None
+        except requests.RequestException as e:
+            print(f"  Warning: failed to fetch MikroTik {family} block list: {e}", file=sys.stderr)
+            list_cache[family] = None
+        return list_cache[family]
 
     print(f"\n🔄 Syncing {len(subnets_to_block)} subnets to MikroTik list '{block_list}' "
           f"({sum(1 for s, _, _ in subnets_to_block if s in already_blocked)} already permanently "
@@ -535,6 +567,8 @@ def sync_subnets_to_mikrotik(conn: sqlite3.Connection, subnets_to_block: list[tu
     newly_blocked = 0
     skipped_already = 0
     failed = 0
+    cleanup_delete_failed = 0
+    cleanup_skipped_no_list = 0
 
     for subnet_str, unique_cnt, total_hits in subnets_to_block:
         try:
@@ -545,36 +579,41 @@ def sync_subnets_to_mikrotik(conn: sqlite3.Connection, subnets_to_block: list[tu
             net = None
 
         base_url = f"https://{mt_host}/rest/{family}/firewall/address-list"
-        auth = (mt_user, mt_pass)
 
         # 1. Remove single IPs covered by this subnet, plus any dynamic entry for the subnet itself.
         #    Runs every time regardless of block state — alert-bridge.py's per-IP temp blocks can
         #    keep landing here even after the subnet itself is permanently blocked.
         removed = 0
-        try:
-            r_get = requests.get(f"{base_url}?list={block_list}", auth=auth, verify=False, timeout=(5, 10))
-            if r_get.status_code == 200:
-                entries = r_get.json()
-                if isinstance(entries, list):
-                    for entry in entries:
-                        addr = entry.get("address", "")
-                        entry_id = entry.get(".id")
-                        if not entry_id or not addr:
-                            continue
+        live_entries = fetch_list_once(family)
+        if live_entries is None:
+            cleanup_skipped_no_list += 1
+        else:
+            for entry in live_entries:
+                addr = entry.get("address", "")
+                entry_id = entry.get(".id")
+                if not entry_id or not addr:
+                    continue
+                try:
+                    addr_obj = ipaddress.ip_address(addr)
+                    if net and addr_obj in net:
                         try:
-                            addr_obj = ipaddress.ip_address(addr)
-                            if net and addr_obj in net:
-                                r_del = requests.delete(f"{base_url}/{entry_id}", auth=auth, verify=False, timeout=(5, 10))
-                                if r_del.status_code in (200, 204):
-                                    removed += 1
-                                    print(f"  🗑️ Removing redundant single IP {addr} (covered by {subnet_str})...", flush=True)
-                                else:
-                                    print(f"  ⚠️ Failed to remove redundant IP {addr}: HTTP {r_del.status_code}", file=sys.stderr)
-                        except ValueError:
-                            if addr == subnet_str and (entry.get("timeout") or entry.get("dynamic") == "true"):
-                                requests.delete(f"{base_url}/{entry_id}", auth=auth, verify=False, timeout=(5, 10))
-        except requests.RequestException as e:
-            print(f"  Warning: failed to query MikroTik entries for {subnet_str}: {e}", file=sys.stderr)
+                            r_del = requests.delete(f"{base_url}/{entry_id}", auth=auth, verify=False, timeout=(5, 10))
+                            if r_del.status_code in (200, 204):
+                                removed += 1
+                                print(f"  🗑️ Removing redundant single IP {addr} (covered by {subnet_str})...", flush=True)
+                            else:
+                                cleanup_delete_failed += 1
+                                print(f"  ⚠️ Failed to remove redundant IP {addr}: HTTP {r_del.status_code}", file=sys.stderr)
+                        except requests.RequestException as e:
+                            cleanup_delete_failed += 1
+                            print(f"  Warning: failed to remove redundant IP {addr}: {e}", file=sys.stderr)
+                except ValueError:
+                    if addr == subnet_str and (entry.get("timeout") or entry.get("dynamic") == "true"):
+                        try:
+                            requests.delete(f"{base_url}/{entry_id}", auth=auth, verify=False, timeout=(5, 10))
+                        except requests.RequestException as e:
+                            cleanup_delete_failed += 1
+                            print(f"  Warning: failed to remove stale dynamic entry for {subnet_str}: {e}", file=sys.stderr)
 
         # 2. Add permanent subnet block — skipped if already recorded (todo #10).
         if subnet_str in already_blocked:
@@ -607,8 +646,11 @@ def sync_subnets_to_mikrotik(conn: sqlite3.Connection, subnets_to_block: list[tu
             failed += 1
 
     print(f"\n[OK] Sync complete: {newly_blocked} newly blocked, {skipped_already} already blocked "
-          f"(hygiene only), {failed} failed.")
-    _jlog(f"sync-mikrotik complete: {newly_blocked} newly blocked, {skipped_already} already blocked, {failed} failed")
+          f"(hygiene only), {failed} block failed, {cleanup_delete_failed} cleanup-delete failed, "
+          f"{cleanup_skipped_no_list} skipped cleanup (couldn't fetch list).")
+    _jlog(f"sync-mikrotik complete: {newly_blocked} newly blocked, {skipped_already} already blocked, "
+          f"{failed} block failed, {cleanup_delete_failed} cleanup-delete failed, "
+          f"{cleanup_skipped_no_list} skipped cleanup")
 
 
 def main():
