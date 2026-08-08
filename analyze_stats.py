@@ -15,9 +15,12 @@ Reads /var/log/suricata/alert_bridge.db directly (no journal parsing):
                         Subnets already recorded in permanent_blocks are skipped for the
                         block step (no repeat PUT) but still get their redundant single-IP
                         entries cleaned up, so re-running is idempotent and quiet.
-  --merge-adjacent      Collapse adjacent /24 entries on the live MikroTik block list into
-                        wider CIDRs (e.g. two neighboring /24s -> one /23). Verifies every
-                        DELETE actually succeeded before claiming the merge worked.
+  --merge-adjacent      Two-part MikroTik cleanup: removes individually-blocked IPs
+                        already covered by an existing subnet of any width (/24 through
+                        /21+), then aggregates subnet entries at any level in one pass
+                        (/24+/24 -> /23, existing /23+/23 -> /22, etc. via
+                        ipaddress.collapse_addresses()). Verifies every DELETE actually
+                        succeeded before claiming an aggregation worked.
 
 With no mode given, prints the --sum summary.
 
@@ -323,19 +326,27 @@ def _record_permanent_block(addr: str, kind: str, signature: str) -> None:
 
 def merge_adjacent_subnets():
     """
-    Collapses adjacent permanently-blocked /24 entries on the live MikroTik
-    block list into wider CIDRs (e.g. 120.120.120.0/24 + 120.120.121.0/24 ->
-    120.120.120.0/23) via ipaddress.collapse_addresses() — only merges pairs
-    that are genuinely bit-aligned/contiguous, never arbitrary neighbors.
+    Two-part cleanup pass over the live MikroTik block list:
 
-    todo #8: every DELETE's response is now checked. Earlier this fired the
-    delete and unconditionally reported the merge as successful even if the
-    router rejected it (a permission hiccup, a stale .id) — the entry would
-    stay live under the router-only comment 'MERGED' at the top, which is
-    misleading. Now a merge is only claimed once every covered /24 is
-    confirmed removed; if any deletion fails, that supernet is skipped
-    entirely rather than left as a wider block sitting on top of a still-live
-    narrower one.
+    1. Individual-IP redundancy: any permanently-blocked single IP (/32) that
+       falls inside an already-blocked subnet — of ANY width on the list, not
+       just /24 (a /24, /23, /22, /21, ... aggregate all count) — is removed.
+       E.g. IP 1.1.4.20 is deleted if 1.1.0.0/21 is already blocked, even
+       though 1.1.4.20 is not inside a /24 written out anywhere.
+    2. Subnet aggregation, multi-level: every remaining subnet entry (again,
+       any width already on the list) is fed through
+       ipaddress.collapse_addresses(), which merges bit-aligned, contiguous
+       blocks at any level in one pass — /24+/24 -> /23, two existing
+       /23+/23 -> /22, four contiguous /24s straight into /22, etc. It never
+       merges unrelated/misaligned neighbors; only exact, lossless CIDR
+       aggregation. The narrower originals are deleted and the wider block
+       is added — but only once every deletion for that merge is confirmed
+       (todo #8): a failed delete skips that merge instead of leaving an
+       orphaned wider block layered on top of a still-live narrower one.
+
+    Net effect: the live list ends up as the minimal CIDR set covering
+    exactly the same addresses — no single IP left redundant under a
+    subnet, no narrower subnet left redundant under a wider one.
     """
     if requests is None:
         print("\nError: 'requests' library not installed. Install with: sudo apt install python3-requests", file=sys.stderr)
@@ -364,7 +375,11 @@ def merge_adjacent_subnets():
         print("Error: unexpected response shape from MikroTik.", file=sys.stderr)
         return
 
+    # Split into subnet entries (any width, including previously-merged /23,
+    # /22, ...) and single-IP entries. IPv4 only — this REST endpoint
+    # (/rest/ip/...) never carried IPv6, matching the rest of this script.
     subnet_entries: dict[ipaddress.IPv4Network, str] = {}
+    ip_entries: dict[ipaddress.IPv4Address, tuple[str, str]] = {}  # addr -> (raw string, entry_id)
     for entry in entries:
         addr, entry_id = entry.get("address", ""), entry.get(".id")
         if not addr or not entry_id:
@@ -373,21 +388,56 @@ def merge_adjacent_subnets():
             net = ipaddress.ip_network(addr, strict=False)
         except ValueError:
             continue
-        if net.version == 4 and net.prefixlen == 24:
+        if net.version != 4:
+            continue
+        if net.prefixlen == 32:
+            ip_entries[net.network_address] = (addr, entry_id)
+        else:
             subnet_entries[net] = entry_id
 
+    # ── Part 1: individual IPs covered by an already-blocked subnet ──
+    removed_ip_count = 0
+    failed_ip_removals = 0
+    if subnet_entries and ip_entries:
+        subnet_list = list(subnet_entries.keys())
+        for ip_addr, (addr_str, entry_id) in list(ip_entries.items()):
+            if not any(ip_addr in net for net in subnet_list):
+                continue
+            try:
+                r_del = requests.delete(f"{base_url}/{entry_id}", auth=auth, verify=False, timeout=(5, 10))
+                if r_del.status_code in (200, 204):
+                    removed_ip_count += 1
+                    print(f"  🗑️ Removing redundant single IP {addr_str} (covered by an already-blocked subnet)...", flush=True)
+                    del ip_entries[ip_addr]
+                else:
+                    failed_ip_removals += 1
+                    print(f"  ⚠️ Failed to remove covered IP {addr_str}: HTTP {r_del.status_code} {r_del.text}", file=sys.stderr)
+            except requests.RequestException as e:
+                failed_ip_removals += 1
+                print(f"  Warning: failed to remove covered IP {addr_str}: {e}", file=sys.stderr)
+
+    if removed_ip_count or failed_ip_removals:
+        print(f"\n🧹 Individual IPs covered by existing subnets: {removed_ip_count} removed"
+              + (f", {failed_ip_removals} failed" if failed_ip_removals else "") + ".")
+    else:
+        print("\nNo individually-blocked IPs are covered by an existing subnet.")
+    _jlog(f"--merge-adjacent: removed {removed_ip_count} single IPs covered by subnets "
+          f"({failed_ip_removals} failed)")
+
+    # ── Part 2: subnet aggregation, any width, multi-level in one pass ──
     if len(subnet_entries) < 2:
-        print("Nothing to merge — fewer than two /24 entries on the block list.")
-        _jlog("--merge-adjacent: nothing to merge, fewer than two /24 entries")
+        print("Nothing to aggregate — fewer than two subnet entries on the block list.")
+        _jlog("--merge-adjacent: nothing to aggregate, fewer than two subnet entries")
         return
 
-    merges = [n for n in ipaddress.collapse_addresses(subnet_entries.keys()) if n.prefixlen < 24]
+    collapsed = list(ipaddress.collapse_addresses(subnet_entries.keys()))
+    merges = [n for n in collapsed if n not in subnet_entries]  # genuinely new (merged) blocks only
     if not merges:
-        print(f"Checked {len(subnet_entries)} /24 entries — no adjacent pairs to merge.")
-        _jlog(f"--merge-adjacent: checked {len(subnet_entries)} /24 entries, no adjacent pairs")
+        print(f"Checked {len(subnet_entries)} subnet entries — no adjacent blocks to aggregate.")
+        _jlog(f"--merge-adjacent: checked {len(subnet_entries)} subnets, no adjacent aggregation")
         return
 
-    print(f"\n🔗 Found {len(merges)} merge(s) among {len(subnet_entries)} /24 entries:")
+    print(f"\n🔗 Found {len(merges)} aggregation(s) among {len(subnet_entries)} subnet entries:")
     merged_ok = 0
     merged_failed = 0
     for supernet in merges:
@@ -416,15 +466,15 @@ def merge_adjacent_subnets():
             _jlog(f"--merge-adjacent: SKIPPED {supernet}, {len(removed_failed)} deletes failed", syslog.LOG_WARNING)
             continue
 
-        body = {"list": block_list, "address": str(supernet), "comment": f"MERGED ({len(covered)}x /24)"[:60]}
+        body = {"list": block_list, "address": str(supernet), "comment": f"MERGED ({len(covered)}x)"[:60]}
         try:
             r_put = requests.put(base_url, json=body, auth=auth, verify=False, timeout=(5, 15))
             if r_put.status_code in (200, 201) or "already" in r_put.text:
                 print(f"  ✅ Merged {len(removed_ok)} entries into {supernet} "
                       f"(verified {len(removed_ok)}/{len(covered)} removed before adding)")
-                _record_permanent_block(str(supernet), "subnet", f"merged from {len(covered)}x /24")
+                _record_permanent_block(str(supernet), "subnet", f"merged from {len(covered)}x")
                 merged_ok += 1
-                _jlog(f"--merge-adjacent: merged {len(covered)}x /24 into {supernet}")
+                _jlog(f"--merge-adjacent: merged {len(covered)}x into {supernet}")
             else:
                 print(f"  ⚠️ Failed to add {supernet}: {r_put.status_code} {r_put.text}")
                 merged_failed += 1
@@ -433,7 +483,7 @@ def merge_adjacent_subnets():
             print(f"  ⚠️ Exception adding {supernet}: {e}", file=sys.stderr)
             merged_failed += 1
 
-    print(f"\n[OK] Merge complete: {merged_ok} merged, {merged_failed} skipped/failed.")
+    print(f"\n[OK] Aggregation complete: {merged_ok} merged, {merged_failed} skipped/failed.")
 
 
 def sync_subnets_to_mikrotik(conn: sqlite3.Connection, subnets_to_block: list[tuple[str, int, int]]):
@@ -576,7 +626,8 @@ def main():
     parser.add_argument("--sync-mikrotik", "--block-subnets", action="store_true",
                         help="Block /24 subnets with >= --min-ips unique IPs all-time on MikroTik")
     parser.add_argument("--merge-adjacent", action="store_true",
-                        help="Collapse adjacent /24 entries on the live MikroTik block list into wider CIDRs")
+                        help="Remove single IPs covered by an existing subnet (any width), then "
+                             "aggregate subnet entries at any level (/24+/24->/23, /23+/23->/22, ...)")
     args = parser.parse_args()
 
     conn = connect_db()
