@@ -21,6 +21,10 @@ Reads /var/log/suricata/alert_bridge.db directly (no journal parsing):
                         (/24+/24 -> /23, existing /23+/23 -> /22, etc. via
                         ipaddress.collapse_addresses()). Verifies every DELETE actually
                         succeeded before claiming an aggregation worked.
+  --verify-blocks       Cross-check permanent_blocks (SQLite) against the live MikroTik
+                        list. An entry is fine if present exactly OR covered by a wider
+                        subnet already there (e.g. after --merge-adjacent); only a truly
+                        absent entry is reported as missing.
 
 With no mode given, prints the --sum summary.
 
@@ -296,6 +300,117 @@ def cmd_top(conn: sqlite3.Connection, n: int):
         print(f"{r['ip']:<32} | {r['total_hits']:>10,}")
     print("=" * 45)
     _jlog(f"--top {n}: {len(subnets)} subnets ({blocked_count} blocked), {len(ips)} IPs listed")
+
+
+def cmd_verify_blocks(conn: sqlite3.Connection):
+    """
+    Cross-checks permanent_blocks (our SQLite audit of "should be blocked
+    forever") against what MikroTik's live block list actually contains.
+
+    An entry counts as verified if it's present EXACTLY OR is covered by a
+    wider subnet already on the list — being covered is exactly as
+    protective as an exact entry, and is the expected outcome after
+    --merge-adjacent collapses several /24s into one wider CIDR, or after a
+    single redundant IP gets cleaned up because its subnet already covers
+    it. Only a genuinely absent (neither exact nor covered) entry is a real
+    problem — those are listed so they can be re-added.
+    """
+    if requests is None:
+        print("\nError: 'requests' library not installed. Install with: sudo apt install python3-requests", file=sys.stderr)
+        return
+    load_env()
+    mt_host = os.environ.get("MT_HOST", "")
+    mt_user = os.environ.get("MT_USER", "")
+    mt_pass = os.environ.get("MT_PASS", "")
+    block_list = os.environ.get("BLOCK_LIST", "suricata-block")
+    if not mt_host or not mt_user or not mt_pass or "YOUR_" in mt_host or "YOUR_" in mt_pass:
+        print("\nError: MikroTik credentials incomplete in /opt/alert-bridge/env.", file=sys.stderr)
+        return
+
+    try:
+        rows = list(conn.execute(
+            "SELECT ip_or_subnet, kind, signature, blocked_at FROM permanent_blocks ORDER BY blocked_at"
+        ))
+    except sqlite3.OperationalError:
+        print("No permanent_blocks table in this database — nothing to verify "
+              "(an updated alert-bridge.py hasn't run here yet).")
+        return
+    if not rows:
+        print("permanent_blocks is empty — nothing to verify.")
+        return
+
+    auth = (mt_user, mt_pass)
+    # Fetch the live list once per address family — same principle as
+    # sync_subnets_to_mikrotik's fix: never re-fetch per row.
+    live_nets: dict[str, list[ipaddress.IPv4Network | ipaddress.IPv6Network]] = {}
+    fetch_ok: dict[str, bool] = {}
+    for family in ("ip", "ipv6"):
+        url = f"https://{mt_host}/rest/{family}/firewall/address-list"
+        try:
+            r = requests.get(f"{url}?list={block_list}", auth=auth, verify=False, timeout=(5, 20))
+            if r.status_code == 200:
+                data = r.json()
+                nets = []
+                for entry in (data if isinstance(data, list) else []):
+                    addr = entry.get("address", "")
+                    if not addr:
+                        continue
+                    try:
+                        nets.append(ipaddress.ip_network(addr, strict=False))
+                    except ValueError:
+                        continue
+                live_nets[family] = nets
+                fetch_ok[family] = True
+            else:
+                print(f"Warning: failed to fetch {family} block list: HTTP {r.status_code}", file=sys.stderr)
+                live_nets[family] = []
+                fetch_ok[family] = False
+        except requests.RequestException as e:
+            print(f"Warning: failed to fetch {family} block list: {e}", file=sys.stderr)
+            live_nets[family] = []
+            fetch_ok[family] = False
+
+    verified_exact = 0
+    covered_by_wider = 0
+    missing: list[tuple[str, str, str]] = []  # (addr, kind, reason)
+
+    for row in rows:
+        addr_str, kind, sig = row["ip_or_subnet"], row["kind"], row["signature"] or ""
+        try:
+            net_check = ipaddress.ip_network(addr_str, strict=False)
+        except ValueError:
+            missing.append((addr_str, kind, "not a valid IP/subnet in our own record"))
+            continue
+        family = "ipv6" if net_check.version == 6 else "ip"
+        if not fetch_ok[family]:
+            missing.append((addr_str, kind, f"could not verify — {family} list fetch failed"))
+            continue
+        candidates = live_nets[family]
+        if net_check in candidates:
+            verified_exact += 1
+            continue
+        if any(n.prefixlen < net_check.prefixlen and net_check.subnet_of(n) for n in candidates):
+            covered_by_wider += 1
+            continue
+        missing.append((addr_str, kind, sig))
+
+    total = len(rows)
+    print(f"\n🔍 Verified {total} permanent_blocks entries against live MikroTik '{block_list}' list")
+    print("=" * 78)
+    print(f"  Exact match on MikroTik:      {verified_exact}")
+    print(f"  Covered by a wider subnet:   {covered_by_wider}")
+    print(f"  MISSING from MikroTik:       {len(missing)}")
+    print("=" * 78)
+    if missing:
+        print("\nRecorded as permanently blocked, but NOT found on MikroTik (neither exact nor covered):")
+        for addr_str, kind, reason in missing:
+            print(f"  - {addr_str} ({kind})" + (f" — {reason}" if reason else ""))
+        print("\nRe-add subnets with: sudo python3 analyze_stats.py --sync-mikrotik")
+    else:
+        print("\nAll permanently-blocked addresses/subnets are present on the live "
+              "MikroTik list (exact match or covered by a wider subnet).")
+    _jlog(f"--verify-blocks: {total} checked, {verified_exact} exact, {covered_by_wider} covered, "
+          f"{len(missing)} missing")
 
 
 def _record_permanent_block(addr: str, kind: str, signature: str) -> None:
@@ -670,6 +785,9 @@ def main():
     parser.add_argument("--merge-adjacent", action="store_true",
                         help="Remove single IPs covered by an existing subnet (any width), then "
                              "aggregate subnet entries at any level (/24+/24->/23, /23+/23->/22, ...)")
+    parser.add_argument("--verify-blocks", action="store_true",
+                        help="Cross-check permanent_blocks (SQLite) against the live MikroTik list — "
+                             "reports anything recorded as permanently blocked but actually missing")
     args = parser.parse_args()
 
     conn = connect_db()
@@ -698,6 +816,9 @@ def main():
             did_something = True
         if args.merge_adjacent:
             merge_adjacent_subnets()
+            did_something = True
+        if args.verify_blocks:
+            cmd_verify_blocks(conn)
             did_something = True
         if args.sum or not did_something:
             cmd_sum(conn, show_list=args.list, out_fh=out_fh)
