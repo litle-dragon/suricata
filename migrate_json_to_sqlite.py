@@ -25,6 +25,18 @@ import json
 import os
 import sqlite3
 import sys
+import syslog
+
+syslog.openlog(ident="migrate_json_to_sqlite", logoption=syslog.LOG_PID, facility=syslog.LOG_DAEMON)
+
+
+def _jlog(msg: str, level: int = syslog.LOG_INFO) -> None:
+    """Mirror to the journal (todo #6) — this is a one-off manual script, not
+    a systemd service, so its stdout is not captured by journald automatically."""
+    try:
+        syslog.syslog(level, msg)
+    except Exception:
+        pass
 
 DB_FILE = os.environ.get("DB_FILE", "/var/log/suricata/alert_bridge.db")
 TOTAL_STATE_FILE = "/var/log/suricata/alert-bridge-total-state.json"
@@ -95,6 +107,8 @@ def main():
         subnet_hits[get_subnet(ip)] = subnet_hits.get(get_subnet(ip), 0) + cnt
 
     print(f"Found {len(ip_hits):,} inbound IPs and {len(subnet_hits):,} subnets to seed.")
+    _jlog(f"found {len(ip_hits)} inbound IPs and {len(subnet_hits)} subnets to seed "
+          f"(dry_run={args.dry_run})")
     if args.dry_run:
         print("Dry-run: no changes written.")
         return
@@ -122,6 +136,7 @@ def main():
     ins_subnets = after - mid
     print(f"Seeded {ins_ips:,} new IPs and {ins_subnets:,} new subnets "
           f"({len(ip_hits) - ins_ips:,} IPs / {len(subnet_hits) - ins_subnets:,} subnets already present).")
+    _jlog(f"seeded {ins_ips} new IPs and {ins_subnets} new subnets into {args.db}")
 
 
 if __name__ == "__main__":

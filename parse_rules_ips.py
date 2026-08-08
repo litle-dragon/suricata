@@ -10,7 +10,19 @@ import ipaddress
 import os
 import re
 import sys
+import syslog
 from collections import defaultdict
+
+syslog.openlog(ident="parse_rules_ips", logoption=syslog.LOG_PID, facility=syslog.LOG_DAEMON)
+
+
+def _jlog(msg: str, level: int = syslog.LOG_INFO) -> None:
+    """Mirror to the journal (todo #6) — run manually or via cron, not as a
+    systemd service, so stdout is not captured by journald automatically."""
+    try:
+        syslog.syslog(level, msg)
+    except Exception:
+        pass
 
 
 def aggregate_ips_to_24(items: set[str], min_ips_per_24: int = 2) -> list[str]:
@@ -134,9 +146,12 @@ def main():
                 for net in subnets:
                     f.write(f"{net}\n")
             print(f"Successfully saved {len(subnets)} subnets to '{args.output}'.")
+            _jlog(f"saved {len(subnets)} subnets/IPs to {args.output} "
+                  f"(from {args.rules_file})")
         except Exception as e:
             print(f"Error writing to output file: {e}", file=sys.stderr)
     else:
+        _jlog(f"printed {len(subnets)} subnets/IPs to stdout (from {args.rules_file})")
         for net in subnets:
             print(net)
 

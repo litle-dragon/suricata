@@ -10,20 +10,30 @@ with severity <= MAX_SEVERITY:
 
 Persistence: SQLite at /var/log/suricata/alert_bridge.db (WAL mode) is the single
 system of record. Tables: seen_ips / seen_subnets (all-time uniqueness), daily_stats
-(full historical daily archive), slot_digests (6h slot archive), spike_events (anomaly log).
+(full historical daily archive), slot_digests (6h slot archive), spike_events (anomaly log),
+permanent_blocks (audit of everything ever permanently blocked).
 
 Notifications (per-alert Telegram is DISABLED):
   1. Anomaly / Spike Alert: fires only when the inbound alert rate over a sliding
      5-minute window crosses SPIKE_THRESHOLD_N (default 500), with a 15-minute cooldown.
   2. Fixed 6-hour slot digest: aligned to clock slots 00:00-05:59, 06:00-11:59,
-     12:00-17:59, 18:00-23:59; each sent at the following boundary.
+     12:00-17:59, 18:00-23:59; each sent at the following boundary. A batch reconciliation
+     right before the slot resets sends a follow-up summary of anything it had to block.
   3. 07:00 AM daily report: summary of the previous full day, read from daily_stats.
+  4. Service lifecycle: a message on start and on graceful stop (SIGTERM/SIGINT).
+
+Delivery tracking: every archived report/digest/spike row has a `sent` flag, set only
+after a confirmed Telegram 200. On every process start (i.e. on every service status
+change — start, restart, crash recovery) resend_missed_reports() finds any unsent row
+from the last 3 days and resends it before following new alerts.
 """
 
 import ipaddress
 import json
 import os
+import signal
 import sqlite3
+import sys
 import time
 from collections import defaultdict
 
@@ -45,6 +55,10 @@ SUBNET_THRESHOLD = 10     # Unique IPs in /24 subnet today before blocking whole
 SLIDING_WINDOW = 300      # 5-minute sliding window (seconds)
 SPIKE_COOLDOWN = 900      # 15-minute cooldown between spike alerts (seconds)
 SPIKE_THRESHOLD_N = int(os.environ.get("SPIKE_THRESHOLD_N", "500"))  # alerts / 5 min to trigger
+
+# Missed-report resend: only look this far back on startup, so a long-dead
+# database doesn't replay a wall of ancient digests.
+RESEND_LOOKBACK_DAYS = 3
 
 # Reputation-list hits: real enough to block, too common to page about
 QUIET_PREFIXES = ("ET DROP", "ET CINS", "ET TOR", "ET 3CORESec")
@@ -130,6 +144,7 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     single_ips_count INTEGER NOT NULL,
     single_ips_alerts INTEGER NOT NULL,
     top_subnets_json TEXT NOT NULL,
+    sent INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS slot_digests (
@@ -148,6 +163,7 @@ CREATE TABLE IF NOT EXISTS slot_digests (
     single_ips_count INTEGER NOT NULL,
     single_ips_alerts INTEGER NOT NULL,
     top_subnets_json TEXT NOT NULL,
+    sent INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS spike_events (
@@ -158,7 +174,8 @@ CREATE TABLE IF NOT EXISTS spike_events (
     total_alerts INTEGER NOT NULL,
     avg_rate_per_min INTEGER NOT NULL,
     unique_ips INTEGER NOT NULL,
-    top_subnets_json TEXT NOT NULL
+    top_subnets_json TEXT NOT NULL,
+    sent INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS permanent_blocks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,6 +186,11 @@ CREATE TABLE IF NOT EXISTS permanent_blocks (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_permanent_blocks_addr ON permanent_blocks(ip_or_subnet);
 """
+
+# Tables that predate the `sent` delivery-tracking column (todo #1) — added via
+# ALTER TABLE on databases created before this migration; CREATE TABLE IF NOT
+# EXISTS above only helps brand-new databases.
+_SENT_COLUMN_MIGRATIONS = ("daily_stats", "slot_digests", "spike_events")
 
 # ── In-memory hot state ───────────────────────────────────────────────────────
 # All-time uniqueness caches (mirror of seen_ips / seen_subnets, loaded at startup)
@@ -209,6 +231,20 @@ _daily_permanent_subnets_count = 0
 
 _last_7am_report_date = ""
 
+# Graceful shutdown (todo #3): set by the SIGTERM/SIGINT handler, checked by
+# follow()'s poll loop so main() can send a "stopping" message and close the
+# DB cleanly instead of being hard-killed mid-write.
+_shutdown_requested = False
+
+
+def _handle_shutdown_signal(signum, frame) -> None:
+    global _shutdown_requested
+    _shutdown_requested = True
+
+
+signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+signal.signal(signal.SIGINT, _handle_shutdown_signal)
+
 
 def db_init() -> None:
     """Open the SQLite database (WAL mode), create tables, and warm uniqueness caches."""
@@ -219,6 +255,12 @@ def db_init() -> None:
     _conn.execute("PRAGMA journal_mode=WAL;")
     _conn.execute("PRAGMA synchronous=NORMAL;")
     _conn.executescript(SCHEMA)
+    for tbl in _SENT_COLUMN_MIGRATIONS:
+        try:
+            _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN sent INTEGER DEFAULT 0")
+            print(f"migrated {tbl}: added sent column", flush=True)
+        except sqlite3.OperationalError:
+            pass  # column already exists (either from CREATE TABLE or a prior migration)
     _all_time_seen_ips = {row[0] for row in _conn.execute("SELECT ip FROM seen_ips")}
     _all_time_seen_subnets = {row[0] for row in _conn.execute("SELECT subnet FROM seen_subnets")}
     _all_time_subnet_ips = defaultdict(set)
@@ -241,6 +283,7 @@ def db_record_permanent_block(addr: str, kind: str, sig: str) -> None:
         "INSERT OR IGNORE INTO permanent_blocks(ip_or_subnet, kind, signature) VALUES(?,?,?)",
         (addr, kind, sig),
     )
+    print(f"permanent-block-audit {kind}={addr} sig={sig!r}", flush=True)
 
 
 def db_seen_ip(ip: str, is_new: bool) -> None:
@@ -362,9 +405,13 @@ def cooled_down(key: str) -> bool:
     return True
 
 
-def telegram_send(text: str) -> None:
+def telegram_send(text: str) -> bool:
+    """Posts to Telegram. Returns True only on a confirmed HTTP 200 — callers
+    use this to gate the `sent` delivery-tracking flag (todo #1): a report is
+    only marked sent once Telegram actually accepted it, not just because we
+    attempted the POST."""
     if not TG_TOKEN or not TG_CHAT:
-        return
+        return False
     payload = {"chat_id": TG_CHAT, "text": text}
     if TG_THREAD_ID:
         try:
@@ -372,13 +419,17 @@ def telegram_send(text: str) -> None:
         except ValueError:
             pass
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json=payload,
             timeout=10,
         )
+        if r.status_code != 200:
+            print(f"telegram send failed: HTTP {r.status_code} {r.text}", flush=True)
+        return r.status_code == 200
     except requests.RequestException as e:
         print(f"telegram failed: {e}", flush=True)
+        return False
 
 
 def mikrotik_lookup_covered(ip: str) -> str:
@@ -400,6 +451,7 @@ def mikrotik_lookup_covered(ip: str) -> str:
     try:
         r = requests.get(f"{base_url}?list={BLOCK_LIST}", auth=auth, verify=False, timeout=(5, 10))
         if r.status_code != 200:
+            print(f"mikrotik lookup {ip}: HTTP {r.status_code}, treating as absent", flush=True)
             return "absent"
         entries = r.json()
         if not isinstance(entries, list):
@@ -452,6 +504,8 @@ def mikrotik_block(ip_or_subnet: str, signature: str, permanent: bool = False) -
                                     verify=False,
                                     timeout=(5, 10),
                                 )
+                                print(f"mikrotik-action removed stale temp entry for {ip_or_subnet} "
+                                      f"before permanent PUT", flush=True)
         except requests.RequestException as e:
             print(f"mikrotik lookup/delete failed for {ip_or_subnet}: {e}", flush=True)
 
@@ -471,7 +525,10 @@ def mikrotik_block(ip_or_subnet: str, signature: str, permanent: bool = False) -
             verify=False,
             timeout=(5, 15),
         )
-        return r.status_code in (200, 201) or "already" in r.text
+        ok = r.status_code in (200, 201) or "already" in r.text
+        print(f"mikrotik-action block {ip_or_subnet} permanent={permanent} ok={ok} "
+              f"http={r.status_code}", flush=True)
+        return ok
     except requests.RequestException as e:
         print(f"mikrotik block failed for {ip_or_subnet}: {e}", flush=True)
         return False
@@ -533,6 +590,35 @@ def _slot_bounds(slot_index: int) -> tuple[str, str]:
     return f"{start_h:02d}:00", f"{end_h:02d}:59"
 
 
+def _build_periodic_report_lines(header: str, total: int, new_ips: int, new_subnets: int,
+                                  avg_per_ip: int, avg_per_subnet: int, perm_ips: int,
+                                  perm_subnets: int, single_count: int, single_alerts: int,
+                                  top: list[dict], period_label: str) -> list[str]:
+    """Shared body for the 6h slot digest and the 07:00 daily report — both the
+    live senders and resend_missed_reports() build from this so the two paths
+    can never drift apart."""
+    lines = [
+        header,
+        "",
+        f"• Всього алертів за {period_label}: {total:,}",
+        f"• Унікальних нових IP (раніше не бачили): {new_ips:,}",
+        f"• Унікальних нових підмереж (раніше не бачили): {new_subnets:,}",
+        f"• Середня кількість алертів на 1 IP: {avg_per_ip:,}",
+        f"• Середня кількість алертів на 1 підмережу: {avg_per_subnet:,}",
+        f"• Додано в постійний блок ІР за {period_label}: {perm_ips:,}",
+        f"• Додано в постійний блок підмереж за {period_label}: {perm_subnets:,}",
+        "",
+    ]
+    if top:
+        lines += _format_top_lines(top)
+        lines.append("")
+    lines.append(
+        f"Поодинокі нові IP (адреси які не агрегувалися в підмережі): "
+        f"{single_count:,} IP (всього {single_alerts:,} алертів)"
+    )
+    return lines
+
+
 # ── Notification builders ─────────────────────────────────────────────────────
 def send_spike_alert(now: float) -> None:
     """Anomaly / spike alert built from the current 5-minute sliding window."""
@@ -565,13 +651,13 @@ def send_spike_alert(now: float) -> None:
         lines.append("")
     lines.append(f"Поодинокі нові IP: {single_count:,} IP (всього {single_alerts:,} алертів)")
 
-    telegram_send("\n".join(lines))
+    sent_ok = telegram_send("\n".join(lines))
     _conn.execute(
         "INSERT INTO spike_events(start_time, end_time, total_alerts, avg_rate_per_min, "
-        "unique_ips, top_subnets_json) VALUES(?,?,?,?,?,?)",
-        (start, end, total, avg_rate, unique_ips, json.dumps(top)),
+        "unique_ips, top_subnets_json, sent) VALUES(?,?,?,?,?,?,?)",
+        (start, end, total, avg_rate, unique_ips, json.dumps(top), int(sent_ok)),
     )
-    print(f"spike-alert total={total} rate={avg_rate}/min unique_ips={unique_ips}", flush=True)
+    print(f"spike-alert total={total} rate={avg_rate}/min unique_ips={unique_ips} sent={sent_ok}", flush=True)
 
 
 def send_6h_slot_digest(slot_index: int, day: str) -> None:
@@ -586,41 +672,30 @@ def send_6h_slot_digest(slot_index: int, day: str) -> None:
     top, single_count, single_alerts = _top_and_singles(_slot_inbound_subnets)
     start, end = _slot_bounds(slot_index)
 
-    lines = [
-        "📊 6-годинний дайджест нових загроз",
-        f"Період: {start} - {end} ({day})",
-        "",
-        f"• Всього алертів за 6 годин: {total:,}",
-        f"• Унікальних нових IP (раніше не бачили): {new_ips:,}",
-        f"• Унікальних нових підмереж (раніше не бачили): {new_subnets:,}",
-        f"• Середня кількість алертів на 1 IP: {avg_per_ip:,}",
-        f"• Середня кількість алертів на 1 підмережу: {avg_per_subnet:,}",
-        f"• Додано в постійний блок ІР за 6 годин: {_slot_perm_ips_count:,}",
-        f"• Додано в постійний блок підмереж за 6 годин: {_slot_perm_subnets_count:,}",
-        "",
-    ]
-    if top:
-        lines += _format_top_lines(top)
-        lines.append("")
-    lines.append(
-        f"Поодинокі нові IP (адреси які не агрегувалися в підмережі): "
-        f"{single_count:,} IP (всього {single_alerts:,} алертів)"
+    header = f"📊 6-годинний дайджест нових загроз\nПеріод: {start} - {end} ({day})"
+    lines = _build_periodic_report_lines(
+        header, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
+        _slot_perm_ips_count, _slot_perm_subnets_count, single_count, single_alerts,
+        top, "6 годин",
     )
 
-    telegram_send("\n".join(lines))
+    sent_ok = telegram_send("\n".join(lines))
     _conn.execute(
         "INSERT INTO slot_digests(date, slot_index, start_time, end_time, total_alerts, "
         "new_ips_count, new_subnets_count, avg_alerts_per_ip, avg_alerts_per_subnet, "
-        "perm_ips_count, perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "perm_ips_count, perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json, sent) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (day, slot_index, start, end, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
-         _slot_perm_ips_count, _slot_perm_subnets_count, single_count, single_alerts, json.dumps(top)),
+         _slot_perm_ips_count, _slot_perm_subnets_count, single_count, single_alerts, json.dumps(top),
+         int(sent_ok)),
     )
-    print(f"slot-digest slot={slot_index} {start}-{end} total={total} new_ips={new_ips}", flush=True)
+    print(f"slot-digest slot={slot_index} {start}-{end} total={total} new_ips={new_ips} sent={sent_ok}",
+          flush=True)
 
 
 def snapshot_daily_stats(day: str) -> None:
-    """Capture the completed day's summary into daily_stats at midnight rollover."""
+    """Capture the completed day's summary into daily_stats at midnight rollover.
+    `sent` starts at 0; send_7am_daily_report() flips it once Telegram confirms delivery."""
     total = sum(_daily_inbound_counts.values())
     unique_ips = len(_daily_inbound_counts)
     unique_subnets = len(_daily_inbound_subnets)
@@ -633,8 +708,8 @@ def snapshot_daily_stats(day: str) -> None:
     _conn.execute(
         "INSERT OR REPLACE INTO daily_stats(date, total_alerts, unique_ips, unique_subnets, "
         "new_ips_count, new_subnets_count, avg_alerts_per_ip, avg_alerts_per_subnet, "
-        "perm_ips_count, perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "perm_ips_count, perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json, sent) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
         (day, total, unique_ips, unique_subnets, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
          _daily_permanent_ips_count, _daily_permanent_subnets_count, single_count, single_alerts,
          json.dumps(top)),
@@ -659,28 +734,97 @@ def send_7am_daily_report() -> None:
      perm_ips, perm_subnets, single_count, single_alerts, top_json) = row
     top = json.loads(top_json)
 
-    lines = [
-        f"🌅 Звіт за попередній день ({day}) 📊",
-        "",
-        f"• Всього алертів за добу: {total:,}",
-        f"• Унікальних нових IP (раніше не бачили): {new_ips:,}",
-        f"• Унікальних нових підмереж (раніше не бачили): {new_subnets:,}",
-        f"• Середня кількість алертів на 1 IP: {avg_per_ip:,}",
-        f"• Середня кількість алертів на 1 підмережу: {avg_per_subnet:,}",
-        f"• Додано в постійний блок ІР за добу: {perm_ips:,}",
-        f"• Додано в постійний блок підмереж за добу: {perm_subnets:,}",
-        "",
-    ]
-    if top:
-        lines += _format_top_lines(top)
-        lines.append("")
-    lines.append(
-        f"Поодинокі нові IP (адреси які не агрегувалися в підмережі): "
-        f"{single_count:,} IP (всього {single_alerts:,} алертів)"
+    header = f"🌅 Звіт за попередній день ({day}) 📊"
+    lines = _build_periodic_report_lines(
+        header, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
+        perm_ips, perm_subnets, single_count, single_alerts, top, "добу",
     )
 
-    telegram_send("\n".join(lines))
-    print(f"7am-report sent for {day}", flush=True)
+    sent_ok = telegram_send("\n".join(lines))
+    if sent_ok:
+        _conn.execute("UPDATE daily_stats SET sent=1 WHERE date=?", (day,))
+    print(f"7am-report sent for {day}: {sent_ok}", flush=True)
+
+
+def resend_missed_reports() -> None:
+    """
+    Startup delivery reconciliation (todo #1): runs once per process start —
+    i.e. on every service status change (fresh start, systemd restart after a
+    crash, manual restart) — and resends any digest/report/spike that was
+    archived to SQLite but never confirmed-delivered (Telegram unreachable at
+    the time, or the process died between the DB write and the POST).
+    Only looks back RESEND_LOOKBACK_DAYS so a long-idle database doesn't
+    replay a wall of ancient digests on its next start.
+    """
+    cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - RESEND_LOOKBACK_DAYS * 86400))
+    resent = 0
+
+    for row in _conn.execute(
+        "SELECT date, total_alerts, new_ips_count, new_subnets_count, avg_alerts_per_ip, "
+        "avg_alerts_per_subnet, perm_ips_count, perm_subnets_count, single_ips_count, "
+        "single_ips_alerts, top_subnets_json FROM daily_stats WHERE sent=0 AND date>=? ORDER BY date",
+        (cutoff,),
+    ).fetchall():
+        (day, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
+         perm_ips, perm_subnets, single_count, single_alerts, top_json) = row
+        top = json.loads(top_json)
+        header = f"🌅 Звіт за {day} (повторна відправка після рестарту) 📊"
+        lines = _build_periodic_report_lines(
+            header, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
+            perm_ips, perm_subnets, single_count, single_alerts, top, "добу",
+        )
+        sent_ok = telegram_send("\n".join(lines))
+        if sent_ok:
+            _conn.execute("UPDATE daily_stats SET sent=1 WHERE date=?", (day,))
+            resent += 1
+        print(f"resend-daily-report {day} sent={sent_ok}", flush=True)
+
+    for row in _conn.execute(
+        "SELECT id, date, slot_index, start_time, end_time, total_alerts, new_ips_count, "
+        "new_subnets_count, avg_alerts_per_ip, avg_alerts_per_subnet, perm_ips_count, "
+        "perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json "
+        "FROM slot_digests WHERE sent=0 AND date>=? ORDER BY date, slot_index",
+        (cutoff,),
+    ).fetchall():
+        (rid, day, slot_index, start, end, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
+         perm_ips, perm_subnets, single_count, single_alerts, top_json) = row
+        top = json.loads(top_json)
+        header = f"📊 6-годинний дайджест {start} - {end} ({day}) (повторна відправка після рестарту)"
+        lines = _build_periodic_report_lines(
+            header, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
+            perm_ips, perm_subnets, single_count, single_alerts, top, "слот",
+        )
+        sent_ok = telegram_send("\n".join(lines))
+        if sent_ok:
+            _conn.execute("UPDATE slot_digests SET sent=1 WHERE id=?", (rid,))
+            resent += 1
+        print(f"resend-slot-digest id={rid} {day} slot={slot_index} sent={sent_ok}", flush=True)
+
+    for row in _conn.execute(
+        "SELECT id, start_time, end_time, total_alerts, avg_rate_per_min, unique_ips, top_subnets_json "
+        "FROM spike_events WHERE sent=0 AND date(timestamp)>=? ORDER BY id",
+        (cutoff,),
+    ).fetchall():
+        rid, start, end, total, avg_rate, unique_ips, top_json = row
+        top = json.loads(top_json)
+        lines = [
+            "🚨 АНОМАЛЬНИЙ СПЛЕСК АТАК (повторна відправка після рестарту) ⚠️",
+            f"Період: {start} - {end}",
+            "",
+            f"• Всього алертів за 5 хв: {total:,}",
+            f"• Середня інтенсивність: {avg_rate:,} алертів/хв",
+            f"• Унікальних IP-атакуючих: {unique_ips:,}",
+        ]
+        if top:
+            lines.append("")
+            lines += _format_top_lines(top)
+        sent_ok = telegram_send("\n".join(lines))
+        if sent_ok:
+            _conn.execute("UPDATE spike_events SET sent=1 WHERE id=?", (rid,))
+            resent += 1
+        print(f"resend-spike-alert id={rid} sent={sent_ok}", flush=True)
+
+    print(f"resend-missed-reports: {resent} report(s) resent", flush=True)
 
 
 def _reset_slot_state(new_slot: int) -> None:
@@ -725,8 +869,16 @@ def reconcile_slot_blocks() -> None:
     never actually got blocked (a failed MikroTik call, a race with the live
     per-alert check). Reuses the same audit sets the live path maintains, so
     anything already blocked is a no-op here.
+
+    Batch-звірка summary (todo #2): if this pass had to block anything, sends
+    a follow-up Telegram message with the count and a TOP10 of what got
+    blocked in *this* reconciliation run specifically — separate from the
+    slot digest, which reports alert volume, not reconciliation actions.
     """
     global _daily_permanent_ips_count, _daily_permanent_subnets_count
+    newly_blocked_ips: list[tuple[str, int]] = []
+    newly_blocked_subnets: list[tuple[str, int, int]] = []  # (subnet, unique_ips, alerts)
+
     for ip, cnt in _slot_inbound_counts.items():
         if cnt < PERMANENT_THRESHOLD or ip in _permanently_blocked_ips:
             continue
@@ -738,6 +890,7 @@ def reconcile_slot_blocks() -> None:
             _permanently_blocked_ips.add(ip)
             db_record_permanent_block(ip, "ip", "slot-reconcile")
             _daily_permanent_ips_count += 1
+            newly_blocked_ips.append((ip, cnt))
         print(f"slot-reconcile ip={ip} hits={cnt} blocked={blocked}", flush=True)
 
     for subnet_str, info in _slot_inbound_subnets.items():
@@ -749,7 +902,27 @@ def reconcile_slot_blocks() -> None:
             _permanently_blocked_subnets.add(subnet_str)
             db_record_permanent_block(subnet_str, "subnet", "slot-reconcile")
             _daily_permanent_subnets_count += 1
+            newly_blocked_subnets.append((subnet_str, unique_ips, info["alerts"]))
         print(f"slot-reconcile subnet={subnet_str} unique_ips={unique_ips} blocked={blocked}", flush=True)
+
+    if not newly_blocked_ips and not newly_blocked_subnets:
+        return
+
+    lines = [
+        "🔒 Підсумок звірки за 6-годинний слот (batch-звірка)",
+        "",
+        f"• Заблоковано нових IP: {len(newly_blocked_ips):,}",
+        f"• Заблоковано нових підмереж: {len(newly_blocked_subnets):,}",
+    ]
+    if newly_blocked_subnets:
+        top10 = sorted(newly_blocked_subnets, key=lambda x: x[2], reverse=True)[:10]
+        lines.append("")
+        lines.append("ТОП10 заблокованих підмереж цього прогону:")
+        for subnet_str, ips, alerts in top10:
+            lines.append(f"• {subnet_str} — {ips:,} IP | {alerts:,} алертів")
+    telegram_send("\n".join(lines))
+    print(f"slot-reconcile-summary blocked_ips={len(newly_blocked_ips)} "
+          f"blocked_subnets={len(newly_blocked_subnets)}", flush=True)
 
 
 def check_periodic_tasks() -> None:
@@ -786,7 +959,7 @@ def follow(path: str):
     f = None
     inode = None
     pos = None
-    while True:
+    while not _shutdown_requested:
         try:
             st = os.stat(path)
             if f is None or st.st_ino != inode or st.st_size < pos:
@@ -806,6 +979,8 @@ def follow(path: str):
         except FileNotFoundError:
             check_periodic_tasks()
             time.sleep(1)
+    if f:
+        f.close()
 
 
 def main() -> None:
@@ -815,99 +990,124 @@ def main() -> None:
     # Startup guard: if we boot after 07:00, don't re-fire yesterday's report on every restart.
     if int(time.strftime("%H")) >= 7:
         _last_7am_report_date = time.strftime("%Y-%m-%d")
+
+    # Service lifecycle notification (todo #3) — fires on every start, including
+    # systemd auto-restarts after a crash, so a flapping service is visible in TG.
+    telegram_send(f"🟢 alert-bridge запущено (spike N={SPIKE_THRESHOLD_N})")
     print(f"following {EVE_LOG}, blocking via {MT_HOST}, spike N={SPIKE_THRESHOLD_N}", flush=True)
-    for line in follow(EVE_LOG):
-        check_periodic_tasks()
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if ev.get("event_type") != "alert":
-            continue
-        alert = ev.get("alert", {})
-        if alert.get("severity", 3) > MAX_SEVERITY:
-            continue
 
-        direction, target_ip, internal_ip = classify_flow(ev)
-        if not target_ip or whitelisted(target_ip):
-            continue
+    # Delivery reconciliation (todo #1): resend anything archived-but-unconfirmed
+    # before processing new alerts, so a crash/restart never silently drops a report.
+    resend_missed_reports()
 
-        sig = alert.get("signature", "")
-        now = time.time()
+    try:
+        for line in follow(EVE_LOG):
+            check_periodic_tasks()
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("event_type") != "alert":
+                continue
+            alert = ev.get("alert", {})
+            if alert.get("severity", 3) > MAX_SEVERITY:
+                continue
 
-        if direction == "inbound":
-            attempts, subnet_str, subnet_alltime_cnt = record_hit("inbound", target_ip, sig)
+            direction, target_ip, internal_ip = classify_flow(ev)
+            if not target_ip or whitelisted(target_ip):
+                continue
 
-            # Feed anomaly detection with every inbound alert (rate, not per-alert paging)
-            _sliding_window_alerts.append(
-                {"time": now, "ip": target_ip, "sig": sig, "direction": "inbound"}
-            )
-            check_spike(now)
+            sig = alert.get("signature", "")
+            now = time.time()
 
-            # Subnet aggregation: block entire /24 once >= SUBNET_THRESHOLD unique IPs
-            # reached all-time (not reset daily). Checked on every alert in that subnet,
-            # gated by _permanently_blocked_subnets so an already-blocked subnet is a
-            # no-op instead of a repeat REST call — and a prior failed attempt retries
-            # on the very next alert instead of waiting for the count to tick again.
-            if subnet_str not in _permanently_blocked_subnets and subnet_alltime_cnt >= SUBNET_THRESHOLD:
-                blocked_sub = mikrotik_block(
-                    subnet_str, f"SUBNET BLOCK ({subnet_alltime_cnt}+ IPs all-time): {sig}", permanent=True
+            if direction == "inbound":
+                attempts, subnet_str, subnet_alltime_cnt = record_hit("inbound", target_ip, sig)
+
+                # Feed anomaly detection with every inbound alert (rate, not per-alert paging)
+                _sliding_window_alerts.append(
+                    {"time": now, "ip": target_ip, "sig": sig, "direction": "inbound"}
                 )
-                if blocked_sub:
-                    _permanently_blocked_subnets.add(subnet_str)
-                    db_record_permanent_block(subnet_str, "subnet", sig)
-                    _slot_perm_subnets_count += 1
-                    _daily_permanent_subnets_count += 1
-                print(f"subnet-block {sig} subnet={subnet_str} unique_ips={subnet_alltime_cnt} "
-                      f"permanent=True blocked={blocked_sub}", flush=True)
+                check_spike(now)
 
-            if attempts > PERMANENT_THRESHOLD:
-                # Fast path: we already know this IP or its subnet is permanently blocked.
-                if target_ip in _permanently_blocked_ips or subnet_str in _permanently_blocked_subnets:
-                    continue
-                # Local state disagrees with the attempt count — verify against the
-                # router directly rather than assume a stale/missing local record.
-                state = mikrotik_lookup_covered(target_ip)
-                if state == "ip":
-                    _permanently_blocked_ips.add(target_ip)
-                elif state == "subnet":
-                    _permanently_blocked_subnets.add(subnet_str)
-                else:
-                    blocked_retry = mikrotik_block(target_ip, f"RETRY BLOCK (attempts={attempts}): {sig}", permanent=True)
-                    if blocked_retry:
+                # Subnet aggregation: block entire /24 once >= SUBNET_THRESHOLD unique IPs
+                # reached all-time (not reset daily). Checked on every alert in that subnet,
+                # gated by _permanently_blocked_subnets so an already-blocked subnet is a
+                # no-op instead of a repeat REST call — and a prior failed attempt retries
+                # on the very next alert instead of waiting for the count to tick again.
+                if subnet_str not in _permanently_blocked_subnets and subnet_alltime_cnt >= SUBNET_THRESHOLD:
+                    blocked_sub = mikrotik_block(
+                        subnet_str, f"SUBNET BLOCK ({subnet_alltime_cnt}+ IPs all-time): {sig}", permanent=True
+                    )
+                    if blocked_sub:
+                        _permanently_blocked_subnets.add(subnet_str)
+                        db_record_permanent_block(subnet_str, "subnet", sig)
+                        _slot_perm_subnets_count += 1
+                        _daily_permanent_subnets_count += 1
+                    print(f"subnet-block {sig} subnet={subnet_str} unique_ips={subnet_alltime_cnt} "
+                          f"permanent=True blocked={blocked_sub}", flush=True)
+
+                if attempts > PERMANENT_THRESHOLD:
+                    # Fast path: we already know this IP or its subnet is permanently blocked.
+                    if target_ip in _permanently_blocked_ips:
+                        continue
+                    if subnet_str in _permanently_blocked_subnets:
+                        print(f"inbound-alert {sig} attacker={target_ip} attempts={attempts} "
+                              f"skip: subnet {subnet_str} already permanently blocked", flush=True)
+                        continue
+                    # Local state disagrees with the attempt count — verify against the
+                    # router directly rather than assume a stale/missing local record.
+                    state = mikrotik_lookup_covered(target_ip)
+                    if state == "ip":
                         _permanently_blocked_ips.add(target_ip)
-                        db_record_permanent_block(target_ip, "ip", sig)
-                        _slot_perm_ips_count += 1
-                        _daily_permanent_ips_count += 1
-                    print(f"inbound-alert {sig} attacker={target_ip} attempts={attempts} "
-                          f"not-on-router blocked={blocked_retry}", flush=True)
-                continue
+                        print(f"inbound-alert {sig} attacker={target_ip} attempts={attempts} "
+                              f"already-on-router (ip)", flush=True)
+                    elif state == "subnet":
+                        _permanently_blocked_subnets.add(subnet_str)
+                        print(f"inbound-alert {sig} attacker={target_ip} attempts={attempts} "
+                              f"already-on-router (covering subnet {subnet_str})", flush=True)
+                    else:
+                        blocked_retry = mikrotik_block(target_ip, f"RETRY BLOCK (attempts={attempts}): {sig}", permanent=True)
+                        if blocked_retry:
+                            _permanently_blocked_ips.add(target_ip)
+                            db_record_permanent_block(target_ip, "ip", sig)
+                            _slot_perm_ips_count += 1
+                            _daily_permanent_ips_count += 1
+                        print(f"inbound-alert {sig} attacker={target_ip} attempts={attempts} "
+                              f"not-on-router blocked={blocked_retry}", flush=True)
+                    continue
 
-            permanent = (attempts == PERMANENT_THRESHOLD)
+                permanent = (attempts == PERMANENT_THRESHOLD)
 
-            if not permanent and not cooled_down(f"inbound|{target_ip}|{alert.get('signature_id')}"):
-                continue
+                if not permanent and not cooled_down(f"inbound|{target_ip}|{alert.get('signature_id')}"):
+                    continue
 
-            blocked = mikrotik_block(target_ip, sig, permanent=permanent)
-            if permanent and blocked:
-                _permanently_blocked_ips.add(target_ip)
-                db_record_permanent_block(target_ip, "ip", sig)
-                _slot_perm_ips_count += 1
-                _daily_permanent_ips_count += 1
+                blocked = mikrotik_block(target_ip, sig, permanent=permanent)
+                if permanent and blocked:
+                    _permanently_blocked_ips.add(target_ip)
+                    db_record_permanent_block(target_ip, "ip", sig)
+                    _slot_perm_ips_count += 1
+                    _daily_permanent_ips_count += 1
 
-            print(f"inbound-alert {sig} attacker={target_ip} attempts={attempts} "
-                  f"permanent={permanent} blocked={blocked}", flush=True)
+                print(f"inbound-alert {sig} attacker={target_ip} attempts={attempts} "
+                      f"permanent={permanent} blocked={blocked}", flush=True)
 
-        else:
-            # Outbound traffic (LAN -> WAN): always a 1h temporary block, no digest
-            attempts, subnet_str, _ = record_hit("outbound", target_ip, sig)
+            else:
+                # Outbound traffic (LAN -> WAN): always a 1h temporary block, no digest
+                attempts, subnet_str, _ = record_hit("outbound", target_ip, sig)
 
-            if not cooled_down(f"outbound|{target_ip}|{alert.get('signature_id')}"):
-                continue
+                if not cooled_down(f"outbound|{target_ip}|{alert.get('signature_id')}"):
+                    continue
 
-            blocked = mikrotik_block(target_ip, sig, permanent=False)
-            print(f"outbound-alert {sig} target={target_ip} hits={attempts} "
-                  f"blocked={blocked}", flush=True)
+                blocked = mikrotik_block(target_ip, sig, permanent=False)
+                print(f"outbound-alert {sig} target={target_ip} hits={attempts} "
+                      f"blocked={blocked}", flush=True)
+    finally:
+        # Graceful stop (todo #3): reached on SIGTERM/SIGINT (systemd stop/restart)
+        # or an unhandled exception unwinding out of the loop.
+        telegram_send("🔴 alert-bridge зупиняється")
+        print("alert-bridge stopping, closing db", flush=True)
+        if _conn is not None:
+            _conn.close()
 
 
 if __name__ == "__main__":

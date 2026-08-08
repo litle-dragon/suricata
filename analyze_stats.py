@@ -6,14 +6,24 @@ Reads /var/log/suricata/alert_bridge.db directly (no journal parsing):
   --day YYYY-MM-DD      Full breakdown for one historical day.
   --spikes              Log of all anomaly spike alerts (spike_events).
   --top N               Top N attacker subnets and IPs all-time (seen_subnets / seen_ips).
+                        Subnets carry a "Blocked" column (permanent_blocks) so you can
+                        tell noisy-but-unblocked subnets apart from ones already handled.
   --list                With --sum/--day: also print actual new-IP/new-subnet/permanently-blocked
                         addresses (not just counts). Terminal preview is capped per group.
   --list-out FILE       With --list: write the full, untruncated address lists to FILE.
   --sync-mikrotik       Block /24 subnets with >= MIN unique IPs all-time on MikroTik.
+                        Subnets already recorded in permanent_blocks are skipped for the
+                        block step (no repeat PUT) but still get their redundant single-IP
+                        entries cleaned up, so re-running is idempotent and quiet.
   --merge-adjacent      Collapse adjacent /24 entries on the live MikroTik block list into
-                        wider CIDRs (e.g. two neighboring /24s -> one /23).
+                        wider CIDRs (e.g. two neighboring /24s -> one /23). Verifies every
+                        DELETE actually succeeded before claiming the merge worked.
 
 With no mode given, prints the --sum summary.
+
+Every mode also mirrors its key actions to the systemd journal via syslog (see
+`_jlog`) — unlike alert-bridge.service, this script runs ad-hoc (manual / cron),
+so its stdout isn't captured by journald unless explicitly logged.
 """
 
 import argparse
@@ -22,6 +32,7 @@ import json
 import os
 import sqlite3
 import sys
+import syslog
 from collections import defaultdict
 
 try:
@@ -32,6 +43,18 @@ except ImportError:
     requests = None
 
 DB_FILE = os.environ.get("DB_FILE", "/var/log/suricata/alert_bridge.db")
+
+syslog.openlog(ident="analyze_stats", logoption=syslog.LOG_PID, facility=syslog.LOG_DAEMON)
+
+
+def _jlog(msg: str, level: int = syslog.LOG_INFO) -> None:
+    """Mirror a key action to the journal (todo #6) — analyze_stats.py is invoked
+    manually or via cron, not as a systemd service, so unlike alert-bridge.py its
+    stdout is not captured by journald automatically."""
+    try:
+        syslog.syslog(level, msg)
+    except Exception:
+        pass  # journal logging is best-effort; never fail the actual operation over it
 
 
 def load_env():
@@ -82,6 +105,17 @@ def aggregate_seen_subnets(conn: sqlite3.Connection, min_ips: int = 1) -> list[t
     ]
     res.sort(key=lambda x: (x[2], x[1]), reverse=True)
     return res
+
+
+def _permanently_blocked_subnet_set(conn: sqlite3.Connection) -> set[str]:
+    """All subnets ever recorded in permanent_blocks (kind='subnet'). Empty set,
+    not an error, if the DB predates the permanent_blocks migration."""
+    try:
+        return {r["ip_or_subnet"] for r in conn.execute(
+            "SELECT ip_or_subnet FROM permanent_blocks WHERE kind='subnet'"
+        )}
+    except sqlite3.OperationalError:
+        return set()
 
 
 def _new_addresses_for_day(conn: sqlite3.Connection, day: str) -> tuple[list[str], list[str]]:
@@ -177,6 +211,7 @@ def cmd_sum(conn: sqlite3.Connection, show_list: bool = False, out_fh=None):
     print(f"Totals: {tot_alerts:,} alerts | {tot_new_ips:,} new IPs | {tot_new_nets:,} new subnets | "
           f"{tot_perm_ips:,} perm IPs | {tot_perm_nets:,} perm subnets")
     print("=" * 92)
+    _jlog(f"--sum: {len(rows)} days, {tot_alerts} total alerts, {tot_perm_ips} perm IPs, {tot_perm_nets} perm subnets")
 
 
 def cmd_day(conn: sqlite3.Connection, day: str, show_list: bool = False, out_fh=None):
@@ -206,6 +241,7 @@ def cmd_day(conn: sqlite3.Connection, day: str, show_list: bool = False, out_fh=
         for t in top:
             print(f"  {t['subnet']:<20} {t['ips']:>5,} IP | {t['alerts']:>7,} alerts (avg {t['avg']:,}/IP)")
     print("=" * 65)
+    _jlog(f"--day {day}: {r['total_alerts']} alerts, {r['perm_ips_count']} perm IPs, {r['perm_subnets_count']} perm subnets")
 
 
 def cmd_spikes(conn: sqlite3.Connection):
@@ -225,17 +261,26 @@ def cmd_spikes(conn: sqlite3.Connection):
         print(f"{r['timestamp']:<21} | {window:<15} | {r['total_alerts']:>8,} | "
               f"{r['avg_rate_per_min']:>9,} | {r['unique_ips']:>8,}")
     print("=" * 78)
+    _jlog(f"--spikes: {len(rows)} spike events listed")
 
 
 def cmd_top(conn: sqlite3.Connection, n: int):
     subnets = aggregate_seen_subnets(conn, min_ips=1)[:n]
+    blocked_subnets = _permanently_blocked_subnet_set(conn)
+
     print(f"\n🏆 Top {n} attacker subnets all-time (/24, by total hits)")
-    print("=" * 65)
-    print(f"{'Subnet':<22} | {'Unique IPs':>11} | {'Total hits':>11}")
-    print("-" * 65)
+    print("=" * 78)
+    print(f"{'Subnet':<22} | {'Unique IPs':>11} | {'Total hits':>11} | {'Blocked':>9}")
+    print("-" * 78)
+    blocked_count = 0
     for net, uniq, hits in subnets:
-        print(f"{net:<22} | {uniq:>11,} | {hits:>11,}")
-    print("=" * 65)
+        is_blocked = net in blocked_subnets
+        blocked_count += is_blocked
+        print(f"{net:<22} | {uniq:>11,} | {hits:>11,} | {'так' if is_blocked else 'ні':>9}")
+    print("=" * 78)
+    if not blocked_subnets:
+        print("(таблиця permanent_blocks порожня/відсутня — стовпець Blocked покаже "
+              "'ні' для всіх, доки oновлений alert-bridge.py / --sync-mikrotik тут не запускався)")
 
     ips = list(conn.execute(
         "SELECT ip, total_hits FROM seen_ips ORDER BY total_hits DESC LIMIT ?", (n,)
@@ -247,6 +292,7 @@ def cmd_top(conn: sqlite3.Connection, n: int):
     for r in ips:
         print(f"{r['ip']:<32} | {r['total_hits']:>10,}")
     print("=" * 45)
+    _jlog(f"--top {n}: {len(subnets)} subnets ({blocked_count} blocked), {len(ips)} IPs listed")
 
 
 def _record_permanent_block(addr: str, kind: str, signature: str) -> None:
@@ -281,6 +327,15 @@ def merge_adjacent_subnets():
     block list into wider CIDRs (e.g. 120.120.120.0/24 + 120.120.121.0/24 ->
     120.120.120.0/23) via ipaddress.collapse_addresses() — only merges pairs
     that are genuinely bit-aligned/contiguous, never arbitrary neighbors.
+
+    todo #8: every DELETE's response is now checked. Earlier this fired the
+    delete and unconditionally reported the merge as successful even if the
+    router rejected it (a permission hiccup, a stale .id) — the entry would
+    stay live under the router-only comment 'MERGED' at the top, which is
+    misleading. Now a merge is only claimed once every covered /24 is
+    confirmed removed; if any deletion fails, that supernet is skipped
+    entirely rather than left as a wider block sitting on top of a still-live
+    narrower one.
     """
     if requests is None:
         print("\nError: 'requests' library not installed. Install with: sudo apt install python3-requests", file=sys.stderr)
@@ -323,35 +378,85 @@ def merge_adjacent_subnets():
 
     if len(subnet_entries) < 2:
         print("Nothing to merge — fewer than two /24 entries on the block list.")
+        _jlog("--merge-adjacent: nothing to merge, fewer than two /24 entries")
         return
 
     merges = [n for n in ipaddress.collapse_addresses(subnet_entries.keys()) if n.prefixlen < 24]
     if not merges:
         print(f"Checked {len(subnet_entries)} /24 entries — no adjacent pairs to merge.")
+        _jlog(f"--merge-adjacent: checked {len(subnet_entries)} /24 entries, no adjacent pairs")
         return
 
     print(f"\n🔗 Found {len(merges)} merge(s) among {len(subnet_entries)} /24 entries:")
+    merged_ok = 0
+    merged_failed = 0
     for supernet in merges:
         covered = [net for net in subnet_entries if net.subnet_of(supernet)]
         print(f"  {' + '.join(str(n) for n in covered)} -> {supernet}")
+
+        removed_ok: list[ipaddress.IPv4Network] = []
+        removed_failed: list[ipaddress.IPv4Network] = []
         for net in covered:
             try:
-                requests.delete(f"{base_url}/{subnet_entries[net]}", auth=auth, verify=False, timeout=(5, 10))
+                r_del = requests.delete(f"{base_url}/{subnet_entries[net]}", auth=auth, verify=False, timeout=(5, 10))
+                if r_del.status_code in (200, 204):
+                    removed_ok.append(net)
+                else:
+                    removed_failed.append(net)
+                    print(f"  ⚠️ Failed to remove {net}: HTTP {r_del.status_code} {r_del.text}", file=sys.stderr)
             except requests.RequestException as e:
+                removed_failed.append(net)
                 print(f"  Warning: failed to remove {net}: {e}", file=sys.stderr)
+
+        if removed_failed:
+            print(f"  ⚠️ {len(removed_failed)}/{len(covered)} entries failed to remove — "
+                  f"skipping {supernet} (would otherwise leave a wider block layered on top of "
+                  f"still-live narrower entries)")
+            merged_failed += 1
+            _jlog(f"--merge-adjacent: SKIPPED {supernet}, {len(removed_failed)} deletes failed", syslog.LOG_WARNING)
+            continue
+
         body = {"list": block_list, "address": str(supernet), "comment": f"MERGED ({len(covered)}x /24)"[:60]}
         try:
             r_put = requests.put(base_url, json=body, auth=auth, verify=False, timeout=(5, 15))
             if r_put.status_code in (200, 201) or "already" in r_put.text:
-                print(f"  ✅ Added {supernet}")
+                print(f"  ✅ Merged {len(removed_ok)} entries into {supernet} "
+                      f"(verified {len(removed_ok)}/{len(covered)} removed before adding)")
                 _record_permanent_block(str(supernet), "subnet", f"merged from {len(covered)}x /24")
+                merged_ok += 1
+                _jlog(f"--merge-adjacent: merged {len(covered)}x /24 into {supernet}")
             else:
                 print(f"  ⚠️ Failed to add {supernet}: {r_put.status_code} {r_put.text}")
+                merged_failed += 1
+                _jlog(f"--merge-adjacent: PUT failed for {supernet}: HTTP {r_put.status_code}", syslog.LOG_WARNING)
         except requests.RequestException as e:
             print(f"  ⚠️ Exception adding {supernet}: {e}", file=sys.stderr)
+            merged_failed += 1
+
+    print(f"\n[OK] Merge complete: {merged_ok} merged, {merged_failed} skipped/failed.")
 
 
-def sync_subnets_to_mikrotik(subnets_to_block: list[tuple[str, int, int]]):
+def sync_subnets_to_mikrotik(conn: sqlite3.Connection, subnets_to_block: list[tuple[str, int, int]]):
+    """
+    todo #9/#10: the two counts in the block message come from different
+    systems on purpose — `unique_cnt`/`total_hits` are Suricata's all-time
+    view from SQLite (seen_ips), independent of what MikroTik's address-list
+    currently holds; `removed` is however many individual /32 entries this
+    specific run actually deleted from MikroTik. They will not match in
+    general — most of the "N IPs seen all-time" were never put on MikroTik as
+    standalone entries (cooled-down hits, hits that never escalated past the
+    per-IP threshold, etc.), so a smaller `removed` count is expected, not a
+    bug. The message below labels both explicitly instead of just "N IPs".
+
+    Subnets already present in `permanent_blocks` are skipped for the PUT
+    (todo #10) — every prior run reprocessed every subnet meeting the
+    threshold unconditionally, so a subnet blocked on day 1 kept getting a
+    "🔒 Blocked subnet X" line (a no-op MikroTik "already have such entry")
+    on every subsequent run, which read like it was being re-blocked from
+    scratch. Redundant single-IP cleanup for that subnet still runs — new
+    per-IP temporary blocks from alert-bridge.py's own 1h-timeout path can
+    still land inside an already-blocked subnet's range between syncs.
+    """
     if requests is None:
         print("\nError: 'requests' library not installed. Install with: sudo apt install python3-requests", file=sys.stderr)
         return
@@ -371,7 +476,15 @@ def sync_subnets_to_mikrotik(subnets_to_block: list[tuple[str, int, int]]):
         print("\nNo subnets matched the threshold to sync to MikroTik.")
         return
 
-    print(f"\n🔄 Syncing {len(subnets_to_block)} subnets to MikroTik list '{block_list}'...")
+    already_blocked = _permanently_blocked_subnet_set(conn)
+
+    print(f"\n🔄 Syncing {len(subnets_to_block)} subnets to MikroTik list '{block_list}' "
+          f"({sum(1 for s, _, _ in subnets_to_block if s in already_blocked)} already permanently "
+          f"blocked — hygiene-only pass for those)...")
+
+    newly_blocked = 0
+    skipped_already = 0
+    failed = 0
 
     for subnet_str, unique_cnt, total_hits in subnets_to_block:
         try:
@@ -384,7 +497,10 @@ def sync_subnets_to_mikrotik(subnets_to_block: list[tuple[str, int, int]]):
         base_url = f"https://{mt_host}/rest/{family}/firewall/address-list"
         auth = (mt_user, mt_pass)
 
-        # 1. Remove single IPs covered by this subnet, plus any dynamic entry for the subnet itself
+        # 1. Remove single IPs covered by this subnet, plus any dynamic entry for the subnet itself.
+        #    Runs every time regardless of block state — alert-bridge.py's per-IP temp blocks can
+        #    keep landing here even after the subnet itself is permanently blocked.
+        removed = 0
         try:
             r_get = requests.get(f"{base_url}?list={block_list}", auth=auth, verify=False, timeout=(5, 10))
             if r_get.status_code == 200:
@@ -398,15 +514,26 @@ def sync_subnets_to_mikrotik(subnets_to_block: list[tuple[str, int, int]]):
                         try:
                             addr_obj = ipaddress.ip_address(addr)
                             if net and addr_obj in net:
-                                print(f"  🗑️ Removing redundant single IP {addr} (covered by {subnet_str})...", flush=True)
-                                requests.delete(f"{base_url}/{entry_id}", auth=auth, verify=False, timeout=(5, 10))
+                                r_del = requests.delete(f"{base_url}/{entry_id}", auth=auth, verify=False, timeout=(5, 10))
+                                if r_del.status_code in (200, 204):
+                                    removed += 1
+                                    print(f"  🗑️ Removing redundant single IP {addr} (covered by {subnet_str})...", flush=True)
+                                else:
+                                    print(f"  ⚠️ Failed to remove redundant IP {addr}: HTTP {r_del.status_code}", file=sys.stderr)
                         except ValueError:
                             if addr == subnet_str and (entry.get("timeout") or entry.get("dynamic") == "true"):
                                 requests.delete(f"{base_url}/{entry_id}", auth=auth, verify=False, timeout=(5, 10))
         except requests.RequestException as e:
             print(f"  Warning: failed to query MikroTik entries for {subnet_str}: {e}", file=sys.stderr)
 
-        # 2. Add permanent subnet block
+        # 2. Add permanent subnet block — skipped if already recorded (todo #10).
+        if subnet_str in already_blocked:
+            skipped_already += 1
+            if removed:
+                print(f"  ♻️ {subnet_str} вже заблоковано постійно — очищено {removed} застарілих /32 записів")
+            _jlog(f"sync-mikrotik: {subnet_str} already blocked, cleaned {removed} stale /32 entries")
+            continue
+
         body = {
             "list": block_list,
             "address": subnet_str,
@@ -415,12 +542,23 @@ def sync_subnets_to_mikrotik(subnets_to_block: list[tuple[str, int, int]]):
         try:
             r_put = requests.put(base_url, json=body, auth=auth, verify=False, timeout=(5, 15))
             if r_put.status_code in (200, 201) or "already" in r_put.text:
-                print(f"  🔒 Blocked subnet {subnet_str} ({unique_cnt} IPs, {total_hits} hits)", flush=True)
+                extra = f"; {removed} MikroTik entries cleaned this run" if removed else ""
+                print(f"  🔒 Blocked subnet {subnet_str} ({unique_cnt} IPs seen all-time, "
+                      f"{total_hits} hits{extra})", flush=True)
                 _record_permanent_block(subnet_str, "subnet", f"sync-mikrotik ({unique_cnt} IPs, {total_hits} hits)")
+                newly_blocked += 1
+                _jlog(f"sync-mikrotik: blocked {subnet_str} ({unique_cnt} IPs all-time, {total_hits} hits)")
             else:
                 print(f"  ⚠️ Failed to block subnet {subnet_str}: {r_put.status_code} {r_put.text}", flush=True)
+                failed += 1
+                _jlog(f"sync-mikrotik: FAILED to block {subnet_str}: HTTP {r_put.status_code}", syslog.LOG_WARNING)
         except requests.RequestException as e:
             print(f"  ⚠️ Exception blocking subnet {subnet_str}: {e}", flush=True)
+            failed += 1
+
+    print(f"\n[OK] Sync complete: {newly_blocked} newly blocked, {skipped_already} already blocked "
+          f"(hygiene only), {failed} failed.")
+    _jlog(f"sync-mikrotik complete: {newly_blocked} newly blocked, {skipped_already} already blocked, {failed} failed")
 
 
 def main():
@@ -463,7 +601,7 @@ def main():
             did_something = True
         if args.sync_mikrotik:
             subnets = aggregate_seen_subnets(conn, min_ips=max(10, args.min_ips))
-            sync_subnets_to_mikrotik(subnets)
+            sync_subnets_to_mikrotik(conn, subnets)
             did_something = True
         if args.merge_adjacent:
             merge_adjacent_subnets()

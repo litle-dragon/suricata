@@ -13,6 +13,18 @@ import ipaddress
 import json
 import os
 import sys
+import syslog
+
+syslog.openlog(ident="sync_rules_to_mikrotik", logoption=syslog.LOG_PID, facility=syslog.LOG_DAEMON)
+
+
+def _jlog(msg: str, level: int = syslog.LOG_INFO) -> None:
+    """Mirror to the journal (todo #6) — run manually or via cron, not as a
+    systemd service, so stdout is not captured by journald automatically."""
+    try:
+        syslog.syslog(level, msg)
+    except Exception:
+        pass
 
 try:
     import requests
@@ -121,6 +133,8 @@ def sync_via_rest_execute(mt_host: str, auth: tuple[str, str], list_name: str, s
             print(f"   ⚠️ Chunk {idx} execution failed: {e}", flush=True)
 
     print(f"\n✅ Direct REST API Sync complete! {success_count}/{total_items} rules synced to '{list_name}'.", flush=True)
+    _jlog(f"sync complete: {success_count}/{total_items} rules synced to '{list_name}' "
+          f"in {len(chunks)} chunks")
 
 
 def main():
@@ -154,6 +168,8 @@ def main():
     print(f"Loaded {len(raw_items)} items from '{args.subnets_file}'. Deduplicating...", flush=True)
     optimized_items = deduplicate_subnets_and_ips(raw_items)
     print(f"Optimized to {len(optimized_items)} unique subnets/IPs (removed single IPs covered by subnets).", flush=True)
+    _jlog(f"starting sync: {len(raw_items)} raw items -> {len(optimized_items)} after dedup, "
+          f"target list '{args.list_name}'")
 
     auth = (mt_user, mt_pass)
     sync_via_rest_execute(mt_host, auth, args.list_name, optimized_items, chunk_size=args.chunk_size)
