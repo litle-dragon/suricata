@@ -144,6 +144,8 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     single_ips_count INTEGER NOT NULL,
     single_ips_alerts INTEGER NOT NULL,
     top_subnets_json TEXT NOT NULL,
+    new_ips_json TEXT DEFAULT '[]',
+    new_subnets_json TEXT DEFAULT '[]',
     sent INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -163,6 +165,8 @@ CREATE TABLE IF NOT EXISTS slot_digests (
     single_ips_count INTEGER NOT NULL,
     single_ips_alerts INTEGER NOT NULL,
     top_subnets_json TEXT NOT NULL,
+    new_ips_json TEXT DEFAULT '[]',
+    new_subnets_json TEXT DEFAULT '[]',
     sent INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -187,10 +191,18 @@ CREATE TABLE IF NOT EXISTS permanent_blocks (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_permanent_blocks_addr ON permanent_blocks(ip_or_subnet);
 """
 
-# Tables that predate the `sent` delivery-tracking column (todo #1) — added via
-# ALTER TABLE on databases created before this migration; CREATE TABLE IF NOT
-# EXISTS above only helps brand-new databases.
-_SENT_COLUMN_MIGRATIONS = ("daily_stats", "slot_digests", "spike_events")
+# Columns added after initial release — applied via ALTER TABLE on databases
+# created before each migration; CREATE TABLE IF NOT EXISTS above only helps
+# brand-new databases. (table, column, column-definition) triples.
+_SCHEMA_MIGRATIONS = [
+    ("daily_stats", "sent", "INTEGER DEFAULT 0"),
+    ("slot_digests", "sent", "INTEGER DEFAULT 0"),
+    ("spike_events", "sent", "INTEGER DEFAULT 0"),
+    ("daily_stats", "new_ips_json", "TEXT DEFAULT '[]'"),
+    ("daily_stats", "new_subnets_json", "TEXT DEFAULT '[]'"),
+    ("slot_digests", "new_ips_json", "TEXT DEFAULT '[]'"),
+    ("slot_digests", "new_subnets_json", "TEXT DEFAULT '[]'"),
+]
 
 # ── In-memory hot state ───────────────────────────────────────────────────────
 # All-time uniqueness caches (mirror of seen_ips / seen_subnets, loaded at startup)
@@ -255,10 +267,10 @@ def db_init() -> None:
     _conn.execute("PRAGMA journal_mode=WAL;")
     _conn.execute("PRAGMA synchronous=NORMAL;")
     _conn.executescript(SCHEMA)
-    for tbl in _SENT_COLUMN_MIGRATIONS:
+    for tbl, col, coldef in _SCHEMA_MIGRATIONS:
         try:
-            _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN sent INTEGER DEFAULT 0")
-            print(f"migrated {tbl}: added sent column", flush=True)
+            _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {coldef}")
+            print(f"migrated {tbl}: added {col} column", flush=True)
         except sqlite3.OperationalError:
             pass  # column already exists (either from CREATE TABLE or a prior migration)
     _all_time_seen_ips = {row[0] for row in _conn.execute("SELECT ip FROM seen_ips")}
@@ -591,19 +603,35 @@ def _slot_bounds(slot_index: int) -> tuple[str, str]:
     return f"{start_h:02d}:00", f"{end_h:02d}:59"
 
 
+NEW_ADDR_LIST_THRESHOLD = 10  # below this, list the actual new IPs/subnets, not just the count
+
+
 def _build_periodic_report_lines(header: str, total: int, new_ips: int, new_subnets: int,
                                   avg_per_ip: int, avg_per_subnet: int, perm_ips: int,
                                   perm_subnets: int, single_count: int, single_alerts: int,
-                                  top: list[dict], period_label: str) -> list[str]:
+                                  top: list[dict], period_label: str,
+                                  new_ips_list: list[str] | None = None,
+                                  new_subnets_list: list[str] | None = None) -> list[str]:
     """Shared body for the 6h slot digest and the 07:00 daily report — both the
     live senders and resend_missed_reports() build from this so the two paths
-    can never drift apart."""
+    can never drift apart.
+
+    When new_ips/new_subnets is below NEW_ADDR_LIST_THRESHOLD, the actual
+    addresses are listed under their count line - a handful of new attackers
+    is worth naming individually, hundreds is not (that is what --list /
+    --list-out in analyze_stats.py are for)."""
     lines = [
         header,
         "",
         f"• Всього алертів за {period_label}: {total:,}",
         f"• Унікальних нових IP (раніше не бачили): {new_ips:,}",
-        f"• Унікальних нових підмереж (раніше не бачили): {new_subnets:,}",
+    ]
+    if new_ips_list and new_ips < NEW_ADDR_LIST_THRESHOLD:
+        lines += [f"    - {ip}" for ip in new_ips_list]
+    lines.append(f"• Унікальних нових підмереж (раніше не бачили): {new_subnets:,}")
+    if new_subnets_list and new_subnets < NEW_ADDR_LIST_THRESHOLD:
+        lines += [f"    - {net}" for net in new_subnets_list]
+    lines += [
         f"• Середня кількість алертів на 1 IP: {avg_per_ip:,}",
         f"• Середня кількість алертів на 1 підмережу: {avg_per_subnet:,}",
         f"• Додано в постійний блок ІР за {period_label}: {perm_ips:,}",
@@ -672,23 +700,26 @@ def send_6h_slot_digest(slot_index: int, day: str) -> None:
     avg_per_subnet = round(total / unique_subnets) if unique_subnets else 0
     top, single_count, single_alerts = _top_and_singles(_slot_inbound_subnets)
     start, end = _slot_bounds(slot_index)
+    new_ips_list = sorted(_slot_new_ips) if new_ips < NEW_ADDR_LIST_THRESHOLD else []
+    new_subnets_list = sorted(_slot_new_subnets) if new_subnets < NEW_ADDR_LIST_THRESHOLD else []
 
     header = f"📊 6-годинний дайджест нових загроз\nПеріод: {start} - {end} ({day})"
     lines = _build_periodic_report_lines(
         header, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
         _slot_perm_ips_count, _slot_perm_subnets_count, single_count, single_alerts,
-        top, "6 годин",
+        top, "6 годин", new_ips_list=new_ips_list, new_subnets_list=new_subnets_list,
     )
 
     sent_ok = telegram_send("\n".join(lines))
     _conn.execute(
         "INSERT INTO slot_digests(date, slot_index, start_time, end_time, total_alerts, "
         "new_ips_count, new_subnets_count, avg_alerts_per_ip, avg_alerts_per_subnet, "
-        "perm_ips_count, perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json, sent) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "perm_ips_count, perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json, "
+        "new_ips_json, new_subnets_json, sent) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (day, slot_index, start, end, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
          _slot_perm_ips_count, _slot_perm_subnets_count, single_count, single_alerts, json.dumps(top),
-         int(sent_ok)),
+         json.dumps(new_ips_list), json.dumps(new_subnets_list), int(sent_ok)),
     )
     print(f"slot-digest slot={slot_index} {start}-{end} total={total} new_ips={new_ips} sent={sent_ok}",
           flush=True)
@@ -705,15 +736,18 @@ def snapshot_daily_stats(day: str) -> None:
     avg_per_ip = round(total / unique_ips) if unique_ips else 0
     avg_per_subnet = round(total / unique_subnets) if unique_subnets else 0
     top, single_count, single_alerts = _top_and_singles(_daily_inbound_subnets)
+    new_ips_list = sorted(_daily_new_ips) if new_ips < NEW_ADDR_LIST_THRESHOLD else []
+    new_subnets_list = sorted(_daily_new_subnets) if new_subnets < NEW_ADDR_LIST_THRESHOLD else []
 
     _conn.execute(
         "INSERT OR REPLACE INTO daily_stats(date, total_alerts, unique_ips, unique_subnets, "
         "new_ips_count, new_subnets_count, avg_alerts_per_ip, avg_alerts_per_subnet, "
-        "perm_ips_count, perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json, sent) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+        "perm_ips_count, perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json, "
+        "new_ips_json, new_subnets_json, sent) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
         (day, total, unique_ips, unique_subnets, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
          _daily_permanent_ips_count, _daily_permanent_subnets_count, single_count, single_alerts,
-         json.dumps(top)),
+         json.dumps(top), json.dumps(new_ips_list), json.dumps(new_subnets_list)),
     )
     print(f"daily-snapshot {day} total={total} unique_ips={unique_ips} new_ips={new_ips}", flush=True)
 
@@ -724,7 +758,8 @@ def send_7am_daily_report() -> None:
     row = _conn.execute(
         "SELECT date, total_alerts, new_ips_count, new_subnets_count, avg_alerts_per_ip, "
         "avg_alerts_per_subnet, perm_ips_count, perm_subnets_count, single_ips_count, "
-        "single_ips_alerts, top_subnets_json FROM daily_stats WHERE date=?",
+        "single_ips_alerts, top_subnets_json, new_ips_json, new_subnets_json "
+        "FROM daily_stats WHERE date=?",
         (yesterday,),
     ).fetchone()
     if not row:
@@ -732,13 +767,17 @@ def send_7am_daily_report() -> None:
         return
 
     (day, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
-     perm_ips, perm_subnets, single_count, single_alerts, top_json) = row
+     perm_ips, perm_subnets, single_count, single_alerts, top_json,
+     new_ips_json, new_subnets_json) = row
     top = json.loads(top_json)
+    new_ips_list = json.loads(new_ips_json) if new_ips_json else []
+    new_subnets_list = json.loads(new_subnets_json) if new_subnets_json else []
 
     header = f"🌅 Звіт за попередній день ({day}) 📊"
     lines = _build_periodic_report_lines(
         header, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
         perm_ips, perm_subnets, single_count, single_alerts, top, "добу",
+        new_ips_list=new_ips_list, new_subnets_list=new_subnets_list,
     )
 
     sent_ok = telegram_send("\n".join(lines))
@@ -763,16 +802,21 @@ def resend_missed_reports() -> None:
     for row in _conn.execute(
         "SELECT date, total_alerts, new_ips_count, new_subnets_count, avg_alerts_per_ip, "
         "avg_alerts_per_subnet, perm_ips_count, perm_subnets_count, single_ips_count, "
-        "single_ips_alerts, top_subnets_json FROM daily_stats WHERE sent=0 AND date>=? ORDER BY date",
+        "single_ips_alerts, top_subnets_json, new_ips_json, new_subnets_json "
+        "FROM daily_stats WHERE sent=0 AND date>=? ORDER BY date",
         (cutoff,),
     ).fetchall():
         (day, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
-         perm_ips, perm_subnets, single_count, single_alerts, top_json) = row
+         perm_ips, perm_subnets, single_count, single_alerts, top_json,
+         new_ips_json, new_subnets_json) = row
         top = json.loads(top_json)
+        new_ips_list = json.loads(new_ips_json) if new_ips_json else []
+        new_subnets_list = json.loads(new_subnets_json) if new_subnets_json else []
         header = f"🌅 Звіт за {day} (повторна відправка після рестарту) 📊"
         lines = _build_periodic_report_lines(
             header, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
             perm_ips, perm_subnets, single_count, single_alerts, top, "добу",
+            new_ips_list=new_ips_list, new_subnets_list=new_subnets_list,
         )
         sent_ok = telegram_send("\n".join(lines))
         if sent_ok:
@@ -783,17 +827,22 @@ def resend_missed_reports() -> None:
     for row in _conn.execute(
         "SELECT id, date, slot_index, start_time, end_time, total_alerts, new_ips_count, "
         "new_subnets_count, avg_alerts_per_ip, avg_alerts_per_subnet, perm_ips_count, "
-        "perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json "
+        "perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json, "
+        "new_ips_json, new_subnets_json "
         "FROM slot_digests WHERE sent=0 AND date>=? ORDER BY date, slot_index",
         (cutoff,),
     ).fetchall():
         (rid, day, slot_index, start, end, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
-         perm_ips, perm_subnets, single_count, single_alerts, top_json) = row
+         perm_ips, perm_subnets, single_count, single_alerts, top_json,
+         new_ips_json, new_subnets_json) = row
         top = json.loads(top_json)
+        new_ips_list = json.loads(new_ips_json) if new_ips_json else []
+        new_subnets_list = json.loads(new_subnets_json) if new_subnets_json else []
         header = f"📊 6-годинний дайджест {start} - {end} ({day}) (повторна відправка після рестарту)"
         lines = _build_periodic_report_lines(
             header, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
             perm_ips, perm_subnets, single_count, single_alerts, top, "слот",
+            new_ips_list=new_ips_list, new_subnets_list=new_subnets_list,
         )
         sent_ok = telegram_send("\n".join(lines))
         if sent_ok:
