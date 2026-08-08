@@ -538,7 +538,11 @@ def mikrotik_block(ip_or_subnet: str, signature: str, permanent: bool = False) -
 def _top_and_singles(subnets: dict) -> tuple[list[dict], int, int]:
     """
     From {subnet: {"ips": set, "alerts": int}} build:
-      - top list (subnets with >= 2 IPs), sorted by alerts desc then IPs desc
+      - top list (subnets with >= 2 IPs), sorted by alerts desc then IPs desc.
+        Subnets already permanently blocked (via the same all-time audit set
+        the block logic itself uses) are excluded from candidacy entirely —
+        already-handled noise shouldn't crowd a TOP10 slot out from under a
+        subnet that still needs attention; the next runner-up takes its place.
       - single_ips_count / single_ips_alerts (subnets with exactly 1 IP, i.e.
         addresses that did not aggregate into a /24)
     """
@@ -549,6 +553,8 @@ def _top_and_singles(subnets: dict) -> tuple[list[dict], int, int]:
         ip_cnt = len(info["ips"])
         alerts = info["alerts"]
         if ip_cnt >= 2:
+            if subnet in _permanently_blocked_subnets:
+                continue
             top.append({
                 "subnet": subnet,
                 "ips": ip_cnt,
@@ -566,21 +572,16 @@ def _format_top_lines(top: list[dict]) -> list[str]:
     """
     ТОП by alert volume, not by what actually got blocked — a subnet can be
     #1 here from cooldown-skipped or MikroTik-failed hits with zero real
-    blocks. 🔒 marks subnets that are (as of now) actually permanently
-    blocked, via the same all-time audit set the block logic itself uses.
+    blocks. Already permanently-blocked subnets never reach `top` at all —
+    filtered upstream in _top_and_singles() — so every entry here still
+    genuinely needs a look.
     """
     lines = ["ТОП10 підмереж по алертам (/24, від 2+ IP):"]
-    any_blocked = False
     for t in top:
-        blocked = t["subnet"] in _permanently_blocked_subnets
-        any_blocked = any_blocked or blocked
-        mark = " 🔒" if blocked else ""
         lines.append(
             f"• {t['subnet']} — {t['ips']:,} IP | {t['alerts']:,} алертів "
-            f"(сер. {t['avg']:,} алерти/IP){mark}"
+            f"(сер. {t['avg']:,} алерти/IP)"
         )
-    if any_blocked:
-        lines.append("(🔒 = підмережа вже заблокована постійно)")
     return lines
 
 
