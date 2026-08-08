@@ -302,7 +302,7 @@ def cmd_top(conn: sqlite3.Connection, n: int):
     _jlog(f"--top {n}: {len(subnets)} subnets ({blocked_count} blocked), {len(ips)} IPs listed")
 
 
-def cmd_verify_blocks(conn: sqlite3.Connection):
+def cmd_verify_blocks(conn: sqlite3.Connection, fix: bool = False):
     """
     Cross-checks permanent_blocks (our SQLite audit of "should be blocked
     forever") against what MikroTik's live block list actually contains.
@@ -313,7 +313,11 @@ def cmd_verify_blocks(conn: sqlite3.Connection):
     --merge-adjacent collapses several /24s into one wider CIDR, or after a
     single redundant IP gets cleaned up because its subnet already covers
     it. Only a genuinely absent (neither exact nor covered) entry is a real
-    problem — those are listed so they can be re-added.
+    problem.
+
+    With fix=True, every genuinely-missing entry (IP or subnet alike) is
+    PUT back onto the live list with a PERMANENT comment, then re-verified
+    so the closing summary reflects the actual end state.
     """
     if requests is None:
         print("\nError: 'requests' library not installed. Install with: sudo apt install python3-requests", file=sys.stderr)
@@ -340,61 +344,99 @@ def cmd_verify_blocks(conn: sqlite3.Connection):
         return
 
     auth = (mt_user, mt_pass)
-    # Fetch the live list once per address family — same principle as
-    # sync_subnets_to_mikrotik's fix: never re-fetch per row.
-    live_nets: dict[str, list[ipaddress.IPv4Network | ipaddress.IPv6Network]] = {}
-    fetch_ok: dict[str, bool] = {}
-    for family in ("ip", "ipv6"):
-        url = f"https://{mt_host}/rest/{family}/firewall/address-list"
-        try:
-            r = requests.get(f"{url}?list={block_list}", auth=auth, verify=False, timeout=(5, 20))
-            if r.status_code == 200:
-                data = r.json()
-                nets = []
-                for entry in (data if isinstance(data, list) else []):
-                    addr = entry.get("address", "")
-                    if not addr:
-                        continue
-                    try:
-                        nets.append(ipaddress.ip_network(addr, strict=False))
-                    except ValueError:
-                        continue
-                live_nets[family] = nets
-                fetch_ok[family] = True
-            else:
-                print(f"Warning: failed to fetch {family} block list: HTTP {r.status_code}", file=sys.stderr)
-                live_nets[family] = []
-                fetch_ok[family] = False
-        except requests.RequestException as e:
-            print(f"Warning: failed to fetch {family} block list: {e}", file=sys.stderr)
-            live_nets[family] = []
-            fetch_ok[family] = False
 
-    verified_exact = 0
-    covered_by_wider = 0
-    missing: list[tuple[str, str, str]] = []  # (addr, kind, reason)
+    def fetch_live_nets() -> tuple[dict[str, list], dict[str, bool]]:
+        # Fetch the live list once per address family — same principle as
+        # sync_subnets_to_mikrotik's fix: never re-fetch per row.
+        nets_by_family: dict[str, list] = {}
+        ok_by_family: dict[str, bool] = {}
+        for family in ("ip", "ipv6"):
+            url = f"https://{mt_host}/rest/{family}/firewall/address-list"
+            try:
+                r = requests.get(f"{url}?list={block_list}", auth=auth, verify=False, timeout=(5, 20))
+                if r.status_code == 200:
+                    data = r.json()
+                    nets = []
+                    for entry in (data if isinstance(data, list) else []):
+                        addr = entry.get("address", "")
+                        if not addr:
+                            continue
+                        try:
+                            nets.append(ipaddress.ip_network(addr, strict=False))
+                        except ValueError:
+                            continue
+                    nets_by_family[family] = nets
+                    ok_by_family[family] = True
+                else:
+                    print(f"Warning: failed to fetch {family} block list: HTTP {r.status_code}", file=sys.stderr)
+                    nets_by_family[family] = []
+                    ok_by_family[family] = False
+            except requests.RequestException as e:
+                print(f"Warning: failed to fetch {family} block list: {e}", file=sys.stderr)
+                nets_by_family[family] = []
+                ok_by_family[family] = False
+        return nets_by_family, ok_by_family
 
-    for row in rows:
-        addr_str, kind, sig = row["ip_or_subnet"], row["kind"], row["signature"] or ""
-        try:
-            net_check = ipaddress.ip_network(addr_str, strict=False)
-        except ValueError:
-            missing.append((addr_str, kind, "not a valid IP/subnet in our own record"))
-            continue
-        family = "ipv6" if net_check.version == 6 else "ip"
-        if not fetch_ok[family]:
-            missing.append((addr_str, kind, f"could not verify — {family} list fetch failed"))
-            continue
-        candidates = live_nets[family]
-        if net_check in candidates:
-            verified_exact += 1
-            continue
-        if any(n.prefixlen < net_check.prefixlen and net_check.subnet_of(n) for n in candidates):
-            covered_by_wider += 1
-            continue
-        missing.append((addr_str, kind, sig))
+    def classify() -> tuple[int, int, list[tuple[str, str, str]]]:
+        live_nets, fetch_ok = fetch_live_nets()
+        verified_exact = 0
+        covered_by_wider = 0
+        missing: list[tuple[str, str, str]] = []  # (addr, kind, reason)
+        for row in rows:
+            addr_str, kind, sig = row["ip_or_subnet"], row["kind"], row["signature"] or ""
+            try:
+                net_check = ipaddress.ip_network(addr_str, strict=False)
+            except ValueError:
+                missing.append((addr_str, kind, "not a valid IP/subnet in our own record"))
+                continue
+            family = "ipv6" if net_check.version == 6 else "ip"
+            if not fetch_ok[family]:
+                missing.append((addr_str, kind, f"could not verify — {family} list fetch failed"))
+                continue
+            candidates = live_nets[family]
+            if net_check in candidates:
+                verified_exact += 1
+                continue
+            if any(n.prefixlen < net_check.prefixlen and net_check.subnet_of(n) for n in candidates):
+                covered_by_wider += 1
+                continue
+            missing.append((addr_str, kind, sig))
+        return verified_exact, covered_by_wider, missing
 
+    verified_exact, covered_by_wider, missing = classify()
     total = len(rows)
+
+    if fix and missing:
+        fixable = [
+            (addr_str, kind, reason) for addr_str, kind, reason in missing
+            if "not a valid" not in reason and "could not verify" not in reason
+        ]
+        print(f"\n🔧 Re-adding {len(fixable)} missing entr{'y' if len(fixable) == 1 else 'ies'} to MikroTik...")
+        for addr_str, kind, reason in fixable:
+            net_check = ipaddress.ip_network(addr_str, strict=False)
+            family = "ipv6" if net_check.version == 6 else "ip"
+            base_url = f"https://{mt_host}/rest/{family}/firewall/address-list"
+            body = {
+                "list": block_list,
+                "address": addr_str,
+                "comment": f"PERMANENT: {reason or 're-added by --verify-blocks --fix'}"[:60],
+            }
+            status_code = None
+            try:
+                r_put = requests.put(base_url, json=body, auth=auth, verify=False, timeout=(5, 15))
+                status_code = r_put.status_code
+                ok = r_put.status_code in (200, 201) or "already" in r_put.text
+            except requests.RequestException as e:
+                print(f"  ⚠️ Exception re-adding {addr_str}: {e}", file=sys.stderr)
+                ok = False
+            if ok:
+                print(f"  ✅ Re-added {addr_str} ({kind})")
+                _jlog(f"--verify-blocks --fix: re-added {addr_str} ({kind})")
+            else:
+                print(f"  ⚠️ Failed to re-add {addr_str} ({kind}): HTTP {status_code}", file=sys.stderr)
+        # Re-verify against the router's actual post-fix state rather than assuming success.
+        verified_exact, covered_by_wider, missing = classify()
+
     print(f"\n🔍 Verified {total} permanent_blocks entries against live MikroTik '{block_list}' list")
     print("=" * 78)
     print(f"  Exact match on MikroTik:      {verified_exact}")
@@ -405,12 +447,14 @@ def cmd_verify_blocks(conn: sqlite3.Connection):
         print("\nRecorded as permanently blocked, but NOT found on MikroTik (neither exact nor covered):")
         for addr_str, kind, reason in missing:
             print(f"  - {addr_str} ({kind})" + (f" — {reason}" if reason else ""))
-        print("\nRe-add subnets with: sudo python3 analyze_stats.py --sync-mikrotik")
+        if not fix:
+            print("\nRe-add subnets with: sudo python3 analyze_stats.py --sync-mikrotik")
+            print("Or re-add everything (IPs included) with: sudo python3 analyze_stats.py --verify-blocks --fix")
     else:
         print("\nAll permanently-blocked addresses/subnets are present on the live "
               "MikroTik list (exact match or covered by a wider subnet).")
     _jlog(f"--verify-blocks: {total} checked, {verified_exact} exact, {covered_by_wider} covered, "
-          f"{len(missing)} missing")
+          f"{len(missing)} missing, fix={fix}")
 
 
 def _record_permanent_block(addr: str, kind: str, signature: str) -> None:
@@ -788,6 +832,9 @@ def main():
     parser.add_argument("--verify-blocks", action="store_true",
                         help="Cross-check permanent_blocks (SQLite) against the live MikroTik list — "
                              "reports anything recorded as permanently blocked but actually missing")
+    parser.add_argument("--fix", action="store_true",
+                        help="With --verify-blocks: re-add every genuinely-missing entry "
+                             "(IPs and subnets alike) back onto the live MikroTik list")
     args = parser.parse_args()
 
     conn = connect_db()
@@ -818,7 +865,7 @@ def main():
             merge_adjacent_subnets()
             did_something = True
         if args.verify_blocks:
-            cmd_verify_blocks(conn)
+            cmd_verify_blocks(conn, fix=args.fix)
             did_something = True
         if args.sum or not did_something:
             cmd_sum(conn, show_list=args.list, out_fh=out_fh)
