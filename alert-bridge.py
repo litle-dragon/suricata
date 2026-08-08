@@ -495,31 +495,39 @@ def mikrotik_block(ip_or_subnet: str, signature: str, permanent: bool = False) -
     base_url = f"https://{MT_HOST}/rest/{family}/firewall/address-list"
     auth = (MT_USER, MT_PASS)
 
-    if permanent:
-        try:
-            r_get = requests.get(
-                f"{base_url}?list={BLOCK_LIST}&address={ip_or_subnet}",
-                auth=auth,
-                verify=False,
-                timeout=(5, 10),
-            )
-            if r_get.status_code == 200:
-                entries = r_get.json()
-                if isinstance(entries, list):
-                    for entry in entries:
-                        if entry.get("timeout") or entry.get("dynamic") == "true":
-                            entry_id = entry.get(".id")
-                            if entry_id:
-                                requests.delete(
-                                    f"{base_url}/{entry_id}",
-                                    auth=auth,
-                                    verify=False,
-                                    timeout=(5, 10),
-                                )
-                                print(f"mikrotik-action removed stale temp entry for {ip_or_subnet} "
-                                      f"before permanent PUT", flush=True)
-        except requests.RequestException as e:
-            print(f"mikrotik lookup/delete failed for {ip_or_subnet}: {e}", flush=True)
+    # Clear any existing temp/dynamic entry for this exact address before PUT —
+    # for a permanent block this replaces a lingering temp entry outright; for
+    # a temp block it refreshes the timeout on a repeat hit (a different
+    # signature within the cooldown window re-arms cooled_down() and calls
+    # this again, but MikroTik rejects a duplicate PUT with 400 "already have
+    # such entry" and never extends the TTL). An existing PERMANENT entry
+    # (no timeout, dynamic=false) is deliberately left untouched here in
+    # either case — a temp-block call must never downgrade an IP that is
+    # already permanently blocked.
+    try:
+        r_get = requests.get(
+            f"{base_url}?list={BLOCK_LIST}&address={ip_or_subnet}",
+            auth=auth,
+            verify=False,
+            timeout=(5, 10),
+        )
+        if r_get.status_code == 200:
+            entries = r_get.json()
+            if isinstance(entries, list):
+                for entry in entries:
+                    if entry.get("timeout") or entry.get("dynamic") == "true":
+                        entry_id = entry.get(".id")
+                        if entry_id:
+                            requests.delete(
+                                f"{base_url}/{entry_id}",
+                                auth=auth,
+                                verify=False,
+                                timeout=(5, 10),
+                            )
+                            print(f"mikrotik-action removed stale temp entry for {ip_or_subnet} "
+                                  f"before PUT (permanent={permanent})", flush=True)
+    except requests.RequestException as e:
+        print(f"mikrotik lookup/delete failed for {ip_or_subnet}: {e}", flush=True)
 
     body = {
         "list": BLOCK_LIST,
