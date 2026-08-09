@@ -549,15 +549,35 @@ sudo mkdir /opt/alert-bridge/
 sudo curl -o /opt/alert-bridge/alert-bridge.py https://raw.githubusercontent.com/litle-dragon/suricata/main/alert-bridge.py
 sudo curl -o /opt/alert-bridge/analyze_stats.py https://raw.githubusercontent.com/litle-dragon/suricata/main/analyze_stats.py
 sudo curl -o /opt/alert-bridge/env https://raw.githubusercontent.com/litle-dragon/suricata/main/env.example
+sudo curl -o /opt/alert-bridge/alert-bridge.cfg https://raw.githubusercontent.com/litle-dragon/suricata/main/alert-bridge.cfg.example
 sudo curl -o /etc/systemd/system/alert-bridge.service https://raw.githubusercontent.com/litle-dragon/suricata/main/alert-bridge.service
 sudo chmod 600 /opt/alert-bridge/env
 sudo systemctl daemon-reload
 ```
 
-All configuration lives in `/opt/alert-bridge/env`. The template contains
-**no real addresses** — every value is a placeholder (or empty) that you fill
-in during the steps below, so the bridge does nothing until it's configured
+Secrets and per-deployment values (Telegram token, MikroTik credentials, WAN
+IPs) live in `/opt/alert-bridge/env`. The template contains **no real
+addresses** — every value is a placeholder (or empty) that you fill in
+during the steps below, so the bridge does nothing until it's configured
 for *your* network.
+
+Blocking thresholds and other tunable behavior live separately in
+`/opt/alert-bridge/alert-bridge.cfg` (INI format, every key commented with
+its default and rationale in `alert-bridge.cfg.example`). It's optional —
+delete it or leave any key out and the script falls back to the hardcoded
+default — but the file is what you edit to tune sensitivity without
+touching code. Two defaults worth knowing out of the box:
+- `subnet_threshold = 5` — unique all-time attacker IPs in a `/24` before
+  the whole subnet is blocked permanently (lowered from the original 10).
+- `[subnet_multiday]` — a subnet active (≥2 unique IPs) on 2 or more
+  distinct days is blocked permanently regardless of `subnet_threshold`,
+  since a small crew coming back day after day is itself the threat
+  signal, even if it never grows past a handful of IPs.
+
+Restart after editing either file:
+```bash
+sudo systemctl restart alert-bridge
+```
 
 ### 8a. Telegram bot
 
@@ -861,7 +881,8 @@ sudo tail -f /var/log/suricata/eve.json | jq -c 'select(.event_type=="alert") | 
 |---|---|
 | [`alert-bridge.py`](alert-bridge.py) | Tails `eve.json`, blocks attackers via the MikroTik REST API, records to SQLite, and pages Telegram on spikes/digests |
 | [`alert-bridge.service`](alert-bridge.service) | systemd unit for the bridge |
-| [`analyze_stats.py`](analyze_stats.py) | Queries the SQLite database — daily summaries, spike log, top attackers, real addresses, subnet cleanup (`--sum` / `--day` / `--spikes` / `--top` / `--list` / `--list-out` / `--sync-mikrotik` / `--merge-adjacent`) |
+| [`analyze_stats.py`](analyze_stats.py) | Queries the SQLite database — daily summaries, spike log, top attackers, real addresses, subnet cleanup (`--sum` / `--day` / `--spikes` / `--top` / `--list` / `--list-out` / `--sync-mikrotik` / `--merge-adjacent` / `--verify-blocks` / `--fix`) |
 | [`sync-state-from-journal.py`](sync-state-from-journal.py) | Legacy — rebuilt the old JSON state from `journalctl`; unused since the SQLite migration |
 | [`migrate_json_to_sqlite.py`](migrate_json_to_sqlite.py) | One-time — seeds SQLite `seen_ips`/`seen_subnets` from the legacy JSON state so day one isn't all "new" |
-| [`env.example`](env.example) | Configuration template → copy to `/opt/alert-bridge/env` |
+| [`env.example`](env.example) | Secrets/deployment template (Telegram, MikroTik, WAN IPs) → copy to `/opt/alert-bridge/env` |
+| [`alert-bridge.cfg.example`](alert-bridge.cfg.example) | Blocking/anomaly threshold template → copy to `/opt/alert-bridge/alert-bridge.cfg` |

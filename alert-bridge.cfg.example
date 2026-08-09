@@ -1,0 +1,87 @@
+# Suricata alert-bridge — behavior/policy defaults.
+#
+# Copy to /opt/alert-bridge/alert-bridge.cfg and edit as needed, then:
+#   sudo systemctl restart alert-bridge
+#
+# Secrets (Telegram token, MikroTik credentials, WAN IPs) stay in
+# /opt/alert-bridge/env — this file only holds tunable thresholds and
+# timings. A missing file, missing section, or missing key falls back to
+# the hardcoded default noted in each comment below, so alert-bridge.py
+# runs fine even if this file is deleted or only partially filled in.
+
+[blocking]
+# 1=high, 2=medium severity accepted from Suricata; 3=informational is
+# always ignored regardless of this setting. (default: 2)
+max_severity = 2
+
+# Temporary block duration on MikroTik for inbound hits 1-2, RouterOS
+# timeout syntax (e.g. 1h, 30m, 2h30m). (default: 1h)
+block_timeout = 1h
+
+# Seconds before re-issuing a MikroTik REST call for the same (ip,
+# signature) pair — protects the router from being hammered by a fast
+# repeat scan. (default: 300)
+cooldown = 300
+
+# MikroTik firewall address-list name that blocks are written to; must
+# match the list your RouterOS drop/reject rule filters on. (default:
+# suricata-block)
+block_list = suricata-block
+
+# Inbound attempts from the same IP, today, before that individual IP is
+# escalated from a temporary block to a permanent one. (default: 3)
+permanent_threshold = 3
+
+# Unique attacker IPs seen in a /24 (or /64 for IPv6) subnet, ALL-TIME (not
+# reset daily), before the whole subnet is blocked permanently. Lowered
+# from the original default of 10 -- 10 proved too slow to catch small,
+# persistent botnets that never grow past a handful of IPs but keep coming
+# back day after day (see [subnet_multiday] below for that case
+# specifically). (default: 5)
+subnet_threshold = 5
+
+[subnet_multiday]
+# Multi-day persistence override: if a subnet has had >= multiday_min_ips
+# unique attacking IPs on more than one distinct calendar day, it is
+# permanently blocked immediately, regardless of subnet_threshold above.
+# Rationale: a subnet that shows up with a small posse of 2+ IPs on
+# multiple different days is a standing, recurring threat even if its
+# all-time IP count never crosses subnet_threshold -- e.g. the same 6-8
+# IPs hammering every single day never reach 10 (or even 5) unique
+# addresses, but the fact that it's back AGAIN the next day is itself
+# the signal.
+#
+# Minimum unique IPs a subnet needs in a single day to count that day as
+# "active" for this override. (default: 2)
+multiday_min_ips = 2
+
+# Number of distinct "active" days (see above) required before the
+# override fires. 2 means: active today AND on at least one earlier day.
+# (default: 2)
+multiday_days = 2
+
+[anomaly]
+# Sliding window, in seconds, over which inbound alert rate is measured
+# for spike/anomaly detection. (default: 300 = 5 minutes)
+sliding_window = 300
+
+# Alert count within sliding_window that triggers a spike alert to
+# Telegram. (default: 500)
+spike_threshold_n = 500
+
+# Minimum seconds between two spike alerts, so a sustained flood doesn't
+# page repeatedly. (default: 900 = 15 minutes)
+spike_cooldown = 900
+
+[reports]
+# On every service start (restart, crash recovery, deploy), how many days
+# back to look for archived reports/digests that were never confirmed
+# delivered to Telegram (sent=0) and resend them. (default: 3)
+resend_lookback_days = 3
+
+# Below this count of new IPs/subnets in a report period, the digest lists
+# the actual addresses under the count line, not just the number -- a
+# handful of new attackers is worth naming, hundreds is not (use
+# analyze_stats.py --list/--list-out for the full historical list).
+# (default: 10)
+new_addr_list_threshold = 10

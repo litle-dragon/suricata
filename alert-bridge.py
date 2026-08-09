@@ -5,13 +5,25 @@ Follows eve.json like `tail -F` (survives logrotate), and for every alert
 with severity <= MAX_SEVERITY:
   - Classifies flow into Inbound (external attacker -> LAN) or Outbound (LAN -> external target)
   - Inbound traffic: 1h block for hits 1-2. Escalates to PERMANENT block on MikroTik at hit >= 3.
-  - Subnet aggregation: when a /24 subnet reaches 10 unique attacker IPs today, blocks the entire /24 permanently.
+  - Subnet aggregation: when a /24 subnet reaches SUBNET_THRESHOLD (default 5) unique
+    attacker IPs all-time, blocks the entire /24 permanently.
+  - Subnet multi-day override: when a /24 has had >= SUBNET_MULTIDAY_MIN_IPS (default 2)
+    unique attacker IPs on >= SUBNET_MULTIDAY_DAYS (default 2) distinct days, it is blocked
+    permanently regardless of the above threshold -- persistence across days is itself the
+    signal, even for a subnet that never grows past a handful of IPs.
   - Outbound traffic: 1h temporary block on MikroTik.
+
+Configuration: behavior/policy defaults (thresholds, timeouts, cooldowns) live in
+/opt/alert-bridge/alert-bridge.cfg (INI, see alert-bridge.cfg.example) and are loaded once
+at import time via configparser; a missing file or missing key falls back to the hardcoded
+default below, so deploying without a cfg file reproduces the old hardcoded behavior exactly.
+Secrets (Telegram token, MikroTik credentials, WAN IPs) stay in env, never in this file.
 
 Persistence: SQLite at /var/log/suricata/alert_bridge.db (WAL mode) is the single
 system of record. Tables: seen_ips / seen_subnets (all-time uniqueness), daily_stats
 (full historical daily archive), slot_digests (6h slot archive), spike_events (anomaly log),
-permanent_blocks (audit of everything ever permanently blocked).
+permanent_blocks (audit of everything ever permanently blocked), subnet_active_days (per-day
+attacker-IP presence per subnet, drives the multi-day override).
 
 Notifications (per-alert Telegram is DISABLED):
   1. Anomaly / Spike Alert: fires only when the inbound alert rate over a sliding
@@ -28,6 +40,7 @@ change — start, restart, crash recovery) resend_missed_reports() finds any uns
 from the last 3 days and resends it before following new alerts.
 """
 
+import configparser
 import ipaddress
 import json
 import os
@@ -42,23 +55,55 @@ import urllib3
 
 urllib3.disable_warnings()  # self-signed cert on the router's www-ssl
 
+CFG_FILE = os.environ.get("CFG_FILE", "/opt/alert-bridge/alert-bridge.cfg")
+
+
+def _load_cfg() -> configparser.ConfigParser:
+    parser = configparser.ConfigParser()
+    if os.path.exists(CFG_FILE):
+        parser.read(CFG_FILE)
+    return parser
+
+
+_cfg = _load_cfg()
+
+
+def _cfg_int(section: str, key: str, default: int) -> int:
+    return _cfg.getint(section, key, fallback=default)
+
+
+def _cfg_str(section: str, key: str, default: str) -> str:
+    return _cfg.get(section, key, fallback=default)
+
+
 EVE_LOG = "/var/log/suricata/eve.json"
 DB_FILE = os.environ.get("DB_FILE", "/var/log/suricata/alert_bridge.db")
-MAX_SEVERITY = 2          # 1=high, 2=medium; 3=informational is ignored
-BLOCK_TIMEOUT = os.environ.get("BLOCK_TIMEOUT", "1h")  # temporary block duration
-COOLDOWN = 300            # seconds before re-blocking same ip+signature
-BLOCK_LIST = "suricata-block"
-PERMANENT_THRESHOLD = 3   # Inbound attempts today before permanent block
-SUBNET_THRESHOLD = 10     # Unique IPs in /24 subnet today before blocking whole /24
+MAX_SEVERITY = _cfg_int("blocking", "max_severity", 2)  # 1=high, 2=medium; 3=informational is ignored
+# BLOCK_TIMEOUT / SPIKE_THRESHOLD_N: env var wins if set (pre-existing deployments already
+# set these via env), otherwise the cfg file, otherwise the hardcoded default.
+BLOCK_TIMEOUT = os.environ.get("BLOCK_TIMEOUT") or _cfg_str("blocking", "block_timeout", "1h")
+COOLDOWN = _cfg_int("blocking", "cooldown", 300)              # seconds before re-blocking same ip+signature
+BLOCK_LIST = _cfg_str("blocking", "block_list", "suricata-block")
+PERMANENT_THRESHOLD = _cfg_int("blocking", "permanent_threshold", 3)  # inbound attempts today before permanent block
+SUBNET_THRESHOLD = _cfg_int("blocking", "subnet_threshold", 5)        # unique all-time IPs in /24 before blocking it whole
+
+# Multi-day persistence override: a subnet active (>= multiday_min_ips unique IPs) on
+# more than one distinct day is blocked permanently regardless of SUBNET_THRESHOLD --
+# showing up with a small posse on multiple different days is itself the signal, even
+# for a subnet whose all-time IP count never grows past a handful.
+SUBNET_MULTIDAY_MIN_IPS = _cfg_int("subnet_multiday", "multiday_min_ips", 2)
+SUBNET_MULTIDAY_DAYS = _cfg_int("subnet_multiday", "multiday_days", 2)
 
 # Anomaly / spike detection over a sliding window
-SLIDING_WINDOW = 300      # 5-minute sliding window (seconds)
-SPIKE_COOLDOWN = 900      # 15-minute cooldown between spike alerts (seconds)
-SPIKE_THRESHOLD_N = int(os.environ.get("SPIKE_THRESHOLD_N", "500"))  # alerts / 5 min to trigger
+SLIDING_WINDOW = _cfg_int("anomaly", "sliding_window", 300)        # 5-minute sliding window (seconds)
+SPIKE_COOLDOWN = _cfg_int("anomaly", "spike_cooldown", 900)        # 15-minute cooldown between spike alerts (seconds)
+SPIKE_THRESHOLD_N = int(os.environ.get("SPIKE_THRESHOLD_N") or _cfg_int("anomaly", "spike_threshold_n", 500))
 
 # Missed-report resend: only look this far back on startup, so a long-dead
 # database doesn't replay a wall of ancient digests.
-RESEND_LOOKBACK_DAYS = 3
+RESEND_LOOKBACK_DAYS = _cfg_int("reports", "resend_lookback_days", 3)
+# Below this new-address count, digests list the actual addresses, not just the number.
+NEW_ADDR_LIST_THRESHOLD = _cfg_int("reports", "new_addr_list_threshold", 10)
 
 # Reputation-list hits: real enough to block, too common to page about
 QUIET_PREFIXES = ("ET DROP", "ET CINS", "ET TOR", "ET 3CORESec")
@@ -189,6 +234,11 @@ CREATE TABLE IF NOT EXISTS permanent_blocks (
     blocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_permanent_blocks_addr ON permanent_blocks(ip_or_subnet);
+CREATE TABLE IF NOT EXISTS subnet_active_days (
+    subnet TEXT NOT NULL,
+    day TEXT NOT NULL,
+    PRIMARY KEY (subnet, day)
+);
 """
 
 # Columns added after initial release — applied via ALTER TABLE on databases
@@ -216,6 +266,10 @@ _all_time_subnet_ips: dict[str, set[str]] = defaultdict(set)
 # for addresses we already know are permanently in the list.
 _permanently_blocked_ips: set[str] = set()
 _permanently_blocked_subnets: set[str] = set()
+# Per-subnet set of distinct days it has had >= SUBNET_MULTIDAY_MIN_IPS unique
+# attacker IPs (mirror of subnet_active_days table, loaded at startup) — drives
+# the multi-day permanent-block override independent of the all-time IP threshold.
+_subnet_active_days: dict[str, set[str]] = defaultdict(set)
 
 # 5-minute sliding window for anomaly detection
 _sliding_window_alerts: list[dict] = []   # {"time": float, "ip": str, "sig": str, "direction": str}
@@ -262,6 +316,7 @@ def db_init() -> None:
     """Open the SQLite database (WAL mode), create tables, and warm uniqueness caches."""
     global _conn, _all_time_seen_ips, _all_time_seen_subnets
     global _all_time_subnet_ips, _permanently_blocked_ips, _permanently_blocked_subnets
+    global _subnet_active_days
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     _conn = sqlite3.connect(DB_FILE, isolation_level=None)  # autocommit
     _conn.execute("PRAGMA journal_mode=WAL;")
@@ -284,9 +339,13 @@ def db_init() -> None:
     _permanently_blocked_subnets = {
         row[0] for row in _conn.execute("SELECT ip_or_subnet FROM permanent_blocks WHERE kind='subnet'")
     }
+    _subnet_active_days = defaultdict(set)
+    for subnet, day in _conn.execute("SELECT subnet, day FROM subnet_active_days"):
+        _subnet_active_days[subnet].add(day)
     print(f"opened {DB_FILE}: {len(_all_time_seen_ips)} known IPs, "
           f"{len(_all_time_seen_subnets)} known subnets, "
-          f"{len(_permanently_blocked_ips)} perm IPs, {len(_permanently_blocked_subnets)} perm subnets",
+          f"{len(_permanently_blocked_ips)} perm IPs, {len(_permanently_blocked_subnets)} perm subnets, "
+          f"{len(_subnet_active_days)} subnets with multi-day activity tracked",
           flush=True)
 
 
@@ -327,18 +386,18 @@ def get_subnet(ip: str) -> str:
         return ip
 
 
-def record_hit(direction: str, ip: str, sig: str) -> tuple[int, str, int]:
+def record_hit(direction: str, ip: str, sig: str) -> tuple[int, str, int, bool]:
     """
     Records an inbound/outbound hit against slot + daily counters and updates
     all-time uniqueness (seen_ips / seen_subnets / _all_time_subnet_ips) for
     inbound attackers.
-    Returns: (ip_daily_count, subnet_str, subnet_alltime_unique_count)
+    Returns: (ip_daily_count, subnet_str, subnet_alltime_unique_count, subnet_multiday_qualified)
     """
     subnet_str = get_subnet(ip)
 
     if direction != "inbound":
         _daily_outbound_counts[ip] = _daily_outbound_counts.get(ip, 0) + 1
-        return _daily_outbound_counts[ip], subnet_str, 0
+        return _daily_outbound_counts[ip], subnet_str, 0, False
 
     global _slot_alerts_count
 
@@ -373,8 +432,19 @@ def record_hit(direction: str, ip: str, sig: str) -> tuple[int, str, int]:
     s_daily["ips"].add(ip)
     s_daily["alerts"] += 1
 
+    # Multi-day persistence tracking: the first time today's unique-IP count for
+    # this subnet reaches SUBNET_MULTIDAY_MIN_IPS, record today as an "active day"
+    # for it (idempotent past that point — only the crossing moment writes).
+    if len(s_daily["ips"]) >= SUBNET_MULTIDAY_MIN_IPS and _digest_day not in _subnet_active_days[subnet_str]:
+        _subnet_active_days[subnet_str].add(_digest_day)
+        _conn.execute(
+            "INSERT OR IGNORE INTO subnet_active_days(subnet, day) VALUES (?, ?)",
+            (subnet_str, _digest_day),
+        )
+    subnet_multiday_qualified = len(_subnet_active_days[subnet_str]) >= SUBNET_MULTIDAY_DAYS
+
     subnet_alltime_unique_cnt = len(_all_time_subnet_ips[subnet_str])
-    return ip_daily_count, subnet_str, subnet_alltime_unique_cnt
+    return ip_daily_count, subnet_str, subnet_alltime_unique_cnt, subnet_multiday_qualified
 
 
 def whitelisted(ip: str) -> bool:
@@ -609,9 +679,6 @@ def _slot_bounds(slot_index: int) -> tuple[str, str]:
     start_h = slot_index * 6
     end_h = start_h + 5
     return f"{start_h:02d}:00", f"{end_h:02d}:59"
-
-
-NEW_ADDR_LIST_THRESHOLD = 10  # below this, list the actual new IPs/subnets, not just the count
 
 
 def _build_periodic_report_lines(header: str, total: int, new_ips: int, new_subnets: int,
@@ -1079,7 +1146,7 @@ def main() -> None:
             now = time.time()
 
             if direction == "inbound":
-                attempts, subnet_str, subnet_alltime_cnt = record_hit("inbound", target_ip, sig)
+                attempts, subnet_str, subnet_alltime_cnt, subnet_multiday_qualified = record_hit("inbound", target_ip, sig)
 
                 # Feed anomaly detection with every inbound alert (rate, not per-alert paging)
                 _sliding_window_alerts.append(
@@ -1088,21 +1155,31 @@ def main() -> None:
                 check_spike(now)
 
                 # Subnet aggregation: block entire /24 once >= SUBNET_THRESHOLD unique IPs
-                # reached all-time (not reset daily). Checked on every alert in that subnet,
-                # gated by _permanently_blocked_subnets so an already-blocked subnet is a
-                # no-op instead of a repeat REST call — and a prior failed attempt retries
-                # on the very next alert instead of waiting for the count to tick again.
-                if subnet_str not in _permanently_blocked_subnets and subnet_alltime_cnt >= SUBNET_THRESHOLD:
-                    blocked_sub = mikrotik_block(
-                        subnet_str, f"SUBNET BLOCK ({subnet_alltime_cnt}+ IPs all-time): {sig}", permanent=True
-                    )
+                # reached all-time (not reset daily), OR once it has been active
+                # (>= SUBNET_MULTIDAY_MIN_IPS unique IPs) on >= SUBNET_MULTIDAY_DAYS distinct
+                # days -- multi-day persistence bypasses the all-time headcount threshold
+                # entirely, since showing up on multiple different days is itself the signal
+                # even for a subnet whose all-time IP count never grows past a handful.
+                # Checked on every alert in that subnet, gated by _permanently_blocked_subnets
+                # so an already-blocked subnet is a no-op instead of a repeat REST call — and
+                # a prior failed attempt retries on the very next alert instead of waiting for
+                # the count to tick again.
+                if subnet_str not in _permanently_blocked_subnets and (
+                    subnet_alltime_cnt >= SUBNET_THRESHOLD or subnet_multiday_qualified
+                ):
+                    if subnet_alltime_cnt >= SUBNET_THRESHOLD:
+                        reason = f"SUBNET BLOCK ({subnet_alltime_cnt}+ IPs all-time)"
+                    else:
+                        reason = f"SUBNET BLOCK (active {len(_subnet_active_days[subnet_str])}+ days)"
+                    blocked_sub = mikrotik_block(subnet_str, f"{reason}: {sig}", permanent=True)
                     if blocked_sub:
                         _permanently_blocked_subnets.add(subnet_str)
                         db_record_permanent_block(subnet_str, "subnet", sig)
                         _slot_perm_subnets_count += 1
                         _daily_permanent_subnets_count += 1
                     print(f"subnet-block {sig} subnet={subnet_str} unique_ips={subnet_alltime_cnt} "
-                          f"permanent=True blocked={blocked_sub}", flush=True)
+                          f"active_days={len(_subnet_active_days[subnet_str])} permanent=True blocked={blocked_sub}",
+                          flush=True)
 
                 # Once the whole subnet is permanently blocked, no individual IP
                 # inside it ever needs its own entry — temp (attempts 1-2) or
@@ -1161,7 +1238,7 @@ def main() -> None:
 
             else:
                 # Outbound traffic (LAN -> WAN): always a 1h temporary block, no digest
-                attempts, subnet_str, _ = record_hit("outbound", target_ip, sig)
+                attempts, subnet_str, _, _ = record_hit("outbound", target_ip, sig)
 
                 if not cooled_down(f"outbound|{target_ip}|{alert.get('signature_id')}"):
                     continue
