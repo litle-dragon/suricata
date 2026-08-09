@@ -533,7 +533,7 @@ def mikrotik_lookup_covered(ip: str) -> str:
     try:
         r = requests.get(f"{base_url}?list={BLOCK_LIST}", auth=auth, verify=False, timeout=(5, 10))
         if r.status_code != 200:
-            print(f"mikrotik lookup {ip}: HTTP {r.status_code}, treating as absent", flush=True)
+            print(f"mikrotik lookup {ip}: HTTP {r.status_code} resp={r.text[:200]!r}, treating as absent", flush=True)
             return "absent"
         entries = r.json()
         if not isinstance(entries, list):
@@ -617,7 +617,7 @@ def mikrotik_block(ip_or_subnet: str, signature: str, permanent: bool = False) -
         )
         ok = r.status_code in (200, 201) or "already" in r.text
         print(f"mikrotik-action block {ip_or_subnet} permanent={permanent} ok={ok} "
-              f"http={r.status_code}", flush=True)
+              f"http={r.status_code} resp={r.text[:200]!r}", flush=True)
         return ok
     except requests.RequestException as e:
         print(f"mikrotik block failed for {ip_or_subnet}: {e}", flush=True)
