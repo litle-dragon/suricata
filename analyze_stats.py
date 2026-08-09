@@ -34,6 +34,7 @@ so its stdout isn't captured by journald unless explicitly logged.
 """
 
 import argparse
+import configparser
 import ipaddress
 import json
 import os
@@ -50,6 +51,16 @@ except ImportError:
     requests = None
 
 DB_FILE = os.environ.get("DB_FILE", "/var/log/suricata/alert_bridge.db")
+
+# Same alert-bridge.cfg that alert-bridge.py reads (see [blocking] subnet_threshold
+# there) — --min-ips below defaults to it, so this CLI's manual/cron sync matches
+# whatever threshold the live daemon is actually enforcing, instead of carrying its
+# own separately-hardcoded number that silently drifts out of sync with the daemon's.
+CFG_FILE = os.environ.get("CFG_FILE", "/opt/alert-bridge/alert-bridge.cfg")
+_cfg = configparser.ConfigParser()
+if os.path.exists(CFG_FILE):
+    _cfg.read(CFG_FILE)
+DEFAULT_MIN_IPS = _cfg.getint("blocking", "subnet_threshold", fallback=5)
 
 syslog.openlog(ident="analyze_stats", logoption=syslog.LOG_PID, facility=syslog.LOG_DAEMON)
 
@@ -823,7 +834,9 @@ def main():
                              f"addresses, not just counts (terminal preview capped at {LIST_PREVIEW_LIMIT}/group)")
     parser.add_argument("--list-out", metavar="FILE",
                         help="With --list: write the FULL address lists to FILE instead of truncating them")
-    parser.add_argument("--min-ips", type=int, default=10, help="Min unique IPs per subnet for --sync-mikrotik (default: 10)")
+    parser.add_argument("--min-ips", type=int, default=DEFAULT_MIN_IPS,
+                        help=f"Min unique IPs per subnet for --sync-mikrotik "
+                             f"(default: {DEFAULT_MIN_IPS}, from alert-bridge.cfg [blocking] subnet_threshold)")
     parser.add_argument("--sync-mikrotik", "--block-subnets", action="store_true",
                         help="Block /24 subnets with >= --min-ips unique IPs all-time on MikroTik")
     parser.add_argument("--merge-adjacent", action="store_true",
@@ -858,7 +871,7 @@ def main():
             cmd_top(conn, args.top)
             did_something = True
         if args.sync_mikrotik:
-            subnets = aggregate_seen_subnets(conn, min_ips=max(10, args.min_ips))
+            subnets = aggregate_seen_subnets(conn, min_ips=args.min_ips)
             sync_subnets_to_mikrotik(conn, subnets)
             did_something = True
         if args.merge_adjacent:
