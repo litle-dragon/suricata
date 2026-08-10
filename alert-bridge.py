@@ -191,6 +191,8 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     top_subnets_json TEXT NOT NULL,
     new_ips_json TEXT DEFAULT '[]',
     new_subnets_json TEXT DEFAULT '[]',
+    perm_ips_json TEXT DEFAULT '[]',
+    perm_subnets_json TEXT DEFAULT '[]',
     sent INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -212,6 +214,8 @@ CREATE TABLE IF NOT EXISTS slot_digests (
     top_subnets_json TEXT NOT NULL,
     new_ips_json TEXT DEFAULT '[]',
     new_subnets_json TEXT DEFAULT '[]',
+    perm_ips_json TEXT DEFAULT '[]',
+    perm_subnets_json TEXT DEFAULT '[]',
     sent INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -239,6 +243,12 @@ CREATE TABLE IF NOT EXISTS subnet_active_days (
     day TEXT NOT NULL,
     PRIMARY KEY (subnet, day)
 );
+CREATE TABLE IF NOT EXISTS subnet_daily_ips (
+    subnet TEXT NOT NULL,
+    day TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    PRIMARY KEY (subnet, day, ip)
+);
 """
 
 # Columns added after initial release — applied via ALTER TABLE on databases
@@ -252,6 +262,10 @@ _SCHEMA_MIGRATIONS = [
     ("daily_stats", "new_subnets_json", "TEXT DEFAULT '[]'"),
     ("slot_digests", "new_ips_json", "TEXT DEFAULT '[]'"),
     ("slot_digests", "new_subnets_json", "TEXT DEFAULT '[]'"),
+    ("daily_stats", "perm_ips_json", "TEXT DEFAULT '[]'"),
+    ("daily_stats", "perm_subnets_json", "TEXT DEFAULT '[]'"),
+    ("slot_digests", "perm_ips_json", "TEXT DEFAULT '[]'"),
+    ("slot_digests", "perm_subnets_json", "TEXT DEFAULT '[]'"),
 ]
 
 # ── In-memory hot state ───────────────────────────────────────────────────────
@@ -270,6 +284,15 @@ _permanently_blocked_subnets: set[str] = set()
 # attacker IPs (mirror of subnet_active_days table, loaded at startup) — drives
 # the multi-day permanent-block override independent of the all-time IP threshold.
 _subnet_active_days: dict[str, set[str]] = defaultdict(set)
+# Persisted per-(subnet, day) unique-IP set for TODAY only (mirror of
+# subnet_daily_ips table, loaded at startup) — drives the multi-day
+# "active day" crossing check above. Needs its own persistence because the
+# service restarts mid-day routinely (deploys, crashes); an in-memory-only
+# per-day set would silently reset on every restart and could fragment a
+# calendar day's 2 distinct attacker IPs across separate process lifetimes,
+# so the day never crosses SUBNET_MULTIDAY_MIN_IPS even though it genuinely
+# should have. Pruned to the current day only — see _reset_daily_state().
+_subnet_daily_ips: dict[str, set[str]] = defaultdict(set)
 
 # 5-minute sliding window for anomaly detection
 _sliding_window_alerts: list[dict] = []   # {"time": float, "ip": str, "sig": str, "direction": str}
@@ -284,6 +307,8 @@ _slot_new_ips: set[str] = set()
 _slot_new_subnets: set[str] = set()
 _slot_perm_ips_count = 0
 _slot_perm_subnets_count = 0
+_slot_perm_ips_list: set[str] = set()
+_slot_perm_subnets_list: set[str] = set()
 
 # Daily counters (reset at midnight)
 _digest_day = time.strftime("%Y-%m-%d")
@@ -294,6 +319,8 @@ _daily_new_ips: set[str] = set()
 _daily_new_subnets: set[str] = set()
 _daily_permanent_ips_count = 0
 _daily_permanent_subnets_count = 0
+_daily_permanent_ips_list: set[str] = set()
+_daily_permanent_subnets_list: set[str] = set()
 
 _last_7am_report_date = ""
 
@@ -316,7 +343,7 @@ def db_init() -> None:
     """Open the SQLite database (WAL mode), create tables, and warm uniqueness caches."""
     global _conn, _all_time_seen_ips, _all_time_seen_subnets
     global _all_time_subnet_ips, _permanently_blocked_ips, _permanently_blocked_subnets
-    global _subnet_active_days
+    global _subnet_active_days, _subnet_daily_ips
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     _conn = sqlite3.connect(DB_FILE, isolation_level=None)  # autocommit
     _conn.execute("PRAGMA journal_mode=WAL;")
@@ -342,10 +369,14 @@ def db_init() -> None:
     _subnet_active_days = defaultdict(set)
     for subnet, day in _conn.execute("SELECT subnet, day FROM subnet_active_days"):
         _subnet_active_days[subnet].add(day)
+    _subnet_daily_ips = defaultdict(set)
+    for subnet, ip in _conn.execute("SELECT subnet, ip FROM subnet_daily_ips WHERE day=?", (_digest_day,)):
+        _subnet_daily_ips[subnet].add(ip)
     print(f"opened {DB_FILE}: {len(_all_time_seen_ips)} known IPs, "
           f"{len(_all_time_seen_subnets)} known subnets, "
           f"{len(_permanently_blocked_ips)} perm IPs, {len(_permanently_blocked_subnets)} perm subnets, "
-          f"{len(_subnet_active_days)} subnets with multi-day activity tracked",
+          f"{len(_subnet_active_days)} subnets with multi-day activity tracked, "
+          f"{sum(len(v) for v in _subnet_daily_ips.values())} subnet-IP pairs seen today (restart-safe)",
           flush=True)
 
 
@@ -432,10 +463,22 @@ def record_hit(direction: str, ip: str, sig: str) -> tuple[int, str, int, bool]:
     s_daily["ips"].add(ip)
     s_daily["alerts"] += 1
 
-    # Multi-day persistence tracking: the first time today's unique-IP count for
-    # this subnet reaches SUBNET_MULTIDAY_MIN_IPS, record today as an "active day"
-    # for it (idempotent past that point — only the crossing moment writes).
-    if len(s_daily["ips"]) >= SUBNET_MULTIDAY_MIN_IPS and _digest_day not in _subnet_active_days[subnet_str]:
+    # Multi-day persistence tracking: subnet_daily_ips persists (subnet, day, ip)
+    # triples restart-safe (see _subnet_daily_ips docstring) — the in-memory
+    # s_daily["ips"] above is NOT restart-safe (reset on every process start)
+    # and must never drive this check, or a subnet that gets 2 distinct IPs
+    # split across two process lifetimes on the same calendar day would never
+    # be recorded as an "active day" despite genuinely qualifying.
+    if ip not in _subnet_daily_ips[subnet_str]:
+        _subnet_daily_ips[subnet_str].add(ip)
+        _conn.execute(
+            "INSERT OR IGNORE INTO subnet_daily_ips(subnet, day, ip) VALUES (?, ?, ?)",
+            (subnet_str, _digest_day, ip),
+        )
+    # First time today's persisted unique-IP count for this subnet reaches
+    # SUBNET_MULTIDAY_MIN_IPS, record today as an "active day" for it
+    # (idempotent past that point — only the crossing moment writes).
+    if len(_subnet_daily_ips[subnet_str]) >= SUBNET_MULTIDAY_MIN_IPS and _digest_day not in _subnet_active_days[subnet_str]:
         _subnet_active_days[subnet_str].add(_digest_day)
         _conn.execute(
             "INSERT OR IGNORE INTO subnet_active_days(subnet, day) VALUES (?, ?)",
@@ -686,15 +729,17 @@ def _build_periodic_report_lines(header: str, total: int, new_ips: int, new_subn
                                   perm_subnets: int, single_count: int, single_alerts: int,
                                   top: list[dict], period_label: str,
                                   new_ips_list: list[str] | None = None,
-                                  new_subnets_list: list[str] | None = None) -> list[str]:
+                                  new_subnets_list: list[str] | None = None,
+                                  perm_ips_list: list[str] | None = None,
+                                  perm_subnets_list: list[str] | None = None) -> list[str]:
     """Shared body for the 6h slot digest and the 07:00 daily report — both the
     live senders and resend_missed_reports() build from this so the two paths
     can never drift apart.
 
-    When new_ips/new_subnets is below NEW_ADDR_LIST_THRESHOLD, the actual
-    addresses are listed under their count line - a handful of new attackers
-    is worth naming individually, hundreds is not (that is what --list /
-    --list-out in analyze_stats.py are for)."""
+    When new_ips/new_subnets/perm_ips/perm_subnets is below NEW_ADDR_LIST_THRESHOLD,
+    the actual addresses are listed under their count line - a handful of new
+    attackers or fresh permanent blocks is worth naming individually, hundreds
+    is not (that is what --list / --list-out in analyze_stats.py are for)."""
     lines = [
         header,
         "",
@@ -710,9 +755,13 @@ def _build_periodic_report_lines(header: str, total: int, new_ips: int, new_subn
         f"• Середня кількість алертів на 1 IP: {avg_per_ip:,}",
         f"• Середня кількість алертів на 1 підмережу: {avg_per_subnet:,}",
         f"• Додано в постійний блок ІР за {period_label}: {perm_ips:,}",
-        f"• Додано в постійний блок підмереж за {period_label}: {perm_subnets:,}",
-        "",
     ]
+    if perm_ips_list and perm_ips < NEW_ADDR_LIST_THRESHOLD:
+        lines += [f"    - {ip}" for ip in perm_ips_list]
+    lines.append(f"• Додано в постійний блок підмереж за {period_label}: {perm_subnets:,}")
+    if perm_subnets_list and perm_subnets < NEW_ADDR_LIST_THRESHOLD:
+        lines += [f"    - {net}" for net in perm_subnets_list]
+    lines.append("")
     if top:
         lines += _format_top_lines(top)
         lines.append("")
@@ -777,12 +826,15 @@ def send_6h_slot_digest(slot_index: int, day: str) -> None:
     start, end = _slot_bounds(slot_index)
     new_ips_list = sorted(_slot_new_ips) if new_ips < NEW_ADDR_LIST_THRESHOLD else []
     new_subnets_list = sorted(_slot_new_subnets) if new_subnets < NEW_ADDR_LIST_THRESHOLD else []
+    perm_ips_list = sorted(_slot_perm_ips_list) if _slot_perm_ips_count < NEW_ADDR_LIST_THRESHOLD else []
+    perm_subnets_list = sorted(_slot_perm_subnets_list) if _slot_perm_subnets_count < NEW_ADDR_LIST_THRESHOLD else []
 
     header = f"📊 6-годинний дайджест нових загроз\nПеріод: {start} - {end} ({day})"
     lines = _build_periodic_report_lines(
         header, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
         _slot_perm_ips_count, _slot_perm_subnets_count, single_count, single_alerts,
         top, "6 годин", new_ips_list=new_ips_list, new_subnets_list=new_subnets_list,
+        perm_ips_list=perm_ips_list, perm_subnets_list=perm_subnets_list,
     )
 
     sent_ok = telegram_send("\n".join(lines))
@@ -790,11 +842,12 @@ def send_6h_slot_digest(slot_index: int, day: str) -> None:
         "INSERT INTO slot_digests(date, slot_index, start_time, end_time, total_alerts, "
         "new_ips_count, new_subnets_count, avg_alerts_per_ip, avg_alerts_per_subnet, "
         "perm_ips_count, perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json, "
-        "new_ips_json, new_subnets_json, sent) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json, sent) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (day, slot_index, start, end, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
          _slot_perm_ips_count, _slot_perm_subnets_count, single_count, single_alerts, json.dumps(top),
-         json.dumps(new_ips_list), json.dumps(new_subnets_list), int(sent_ok)),
+         json.dumps(new_ips_list), json.dumps(new_subnets_list),
+         json.dumps(perm_ips_list), json.dumps(perm_subnets_list), int(sent_ok)),
     )
     print(f"slot-digest slot={slot_index} {start}-{end} total={total} new_ips={new_ips} sent={sent_ok}",
           flush=True)
@@ -813,16 +866,19 @@ def snapshot_daily_stats(day: str) -> None:
     top, single_count, single_alerts = _top_and_singles(_daily_inbound_subnets)
     new_ips_list = sorted(_daily_new_ips) if new_ips < NEW_ADDR_LIST_THRESHOLD else []
     new_subnets_list = sorted(_daily_new_subnets) if new_subnets < NEW_ADDR_LIST_THRESHOLD else []
+    perm_ips_list = sorted(_daily_permanent_ips_list) if _daily_permanent_ips_count < NEW_ADDR_LIST_THRESHOLD else []
+    perm_subnets_list = sorted(_daily_permanent_subnets_list) if _daily_permanent_subnets_count < NEW_ADDR_LIST_THRESHOLD else []
 
     _conn.execute(
         "INSERT OR REPLACE INTO daily_stats(date, total_alerts, unique_ips, unique_subnets, "
         "new_ips_count, new_subnets_count, avg_alerts_per_ip, avg_alerts_per_subnet, "
         "perm_ips_count, perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json, "
-        "new_ips_json, new_subnets_json, sent) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+        "new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json, sent) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
         (day, total, unique_ips, unique_subnets, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
          _daily_permanent_ips_count, _daily_permanent_subnets_count, single_count, single_alerts,
-         json.dumps(top), json.dumps(new_ips_list), json.dumps(new_subnets_list)),
+         json.dumps(top), json.dumps(new_ips_list), json.dumps(new_subnets_list),
+         json.dumps(perm_ips_list), json.dumps(perm_subnets_list)),
     )
     print(f"daily-snapshot {day} total={total} unique_ips={unique_ips} new_ips={new_ips}", flush=True)
 
@@ -833,7 +889,8 @@ def send_7am_daily_report() -> None:
     row = _conn.execute(
         "SELECT date, total_alerts, new_ips_count, new_subnets_count, avg_alerts_per_ip, "
         "avg_alerts_per_subnet, perm_ips_count, perm_subnets_count, single_ips_count, "
-        "single_ips_alerts, top_subnets_json, new_ips_json, new_subnets_json "
+        "single_ips_alerts, top_subnets_json, new_ips_json, new_subnets_json, "
+        "perm_ips_json, perm_subnets_json "
         "FROM daily_stats WHERE date=?",
         (yesterday,),
     ).fetchone()
@@ -843,16 +900,19 @@ def send_7am_daily_report() -> None:
 
     (day, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
      perm_ips, perm_subnets, single_count, single_alerts, top_json,
-     new_ips_json, new_subnets_json) = row
+     new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json) = row
     top = json.loads(top_json)
     new_ips_list = json.loads(new_ips_json) if new_ips_json else []
     new_subnets_list = json.loads(new_subnets_json) if new_subnets_json else []
+    perm_ips_list = json.loads(perm_ips_json) if perm_ips_json else []
+    perm_subnets_list = json.loads(perm_subnets_json) if perm_subnets_json else []
 
     header = f"🌅 Звіт за попередній день ({day}) 📊"
     lines = _build_periodic_report_lines(
         header, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
         perm_ips, perm_subnets, single_count, single_alerts, top, "добу",
         new_ips_list=new_ips_list, new_subnets_list=new_subnets_list,
+        perm_ips_list=perm_ips_list, perm_subnets_list=perm_subnets_list,
     )
 
     sent_ok = telegram_send("\n".join(lines))
@@ -877,21 +937,25 @@ def resend_missed_reports() -> None:
     for row in _conn.execute(
         "SELECT date, total_alerts, new_ips_count, new_subnets_count, avg_alerts_per_ip, "
         "avg_alerts_per_subnet, perm_ips_count, perm_subnets_count, single_ips_count, "
-        "single_ips_alerts, top_subnets_json, new_ips_json, new_subnets_json "
+        "single_ips_alerts, top_subnets_json, new_ips_json, new_subnets_json, "
+        "perm_ips_json, perm_subnets_json "
         "FROM daily_stats WHERE sent=0 AND date>=? ORDER BY date",
         (cutoff,),
     ).fetchall():
         (day, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
          perm_ips, perm_subnets, single_count, single_alerts, top_json,
-         new_ips_json, new_subnets_json) = row
+         new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json) = row
         top = json.loads(top_json)
         new_ips_list = json.loads(new_ips_json) if new_ips_json else []
         new_subnets_list = json.loads(new_subnets_json) if new_subnets_json else []
+        perm_ips_list = json.loads(perm_ips_json) if perm_ips_json else []
+        perm_subnets_list = json.loads(perm_subnets_json) if perm_subnets_json else []
         header = f"🌅 Звіт за {day} (повторна відправка після рестарту) 📊"
         lines = _build_periodic_report_lines(
             header, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
             perm_ips, perm_subnets, single_count, single_alerts, top, "добу",
             new_ips_list=new_ips_list, new_subnets_list=new_subnets_list,
+            perm_ips_list=perm_ips_list, perm_subnets_list=perm_subnets_list,
         )
         sent_ok = telegram_send("\n".join(lines))
         if sent_ok:
@@ -903,21 +967,24 @@ def resend_missed_reports() -> None:
         "SELECT id, date, slot_index, start_time, end_time, total_alerts, new_ips_count, "
         "new_subnets_count, avg_alerts_per_ip, avg_alerts_per_subnet, perm_ips_count, "
         "perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json, "
-        "new_ips_json, new_subnets_json "
+        "new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json "
         "FROM slot_digests WHERE sent=0 AND date>=? ORDER BY date, slot_index",
         (cutoff,),
     ).fetchall():
         (rid, day, slot_index, start, end, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
          perm_ips, perm_subnets, single_count, single_alerts, top_json,
-         new_ips_json, new_subnets_json) = row
+         new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json) = row
         top = json.loads(top_json)
         new_ips_list = json.loads(new_ips_json) if new_ips_json else []
         new_subnets_list = json.loads(new_subnets_json) if new_subnets_json else []
+        perm_ips_list = json.loads(perm_ips_json) if perm_ips_json else []
+        perm_subnets_list = json.loads(perm_subnets_json) if perm_subnets_json else []
         header = f"📊 6-годинний дайджест {start} - {end} ({day}) (повторна відправка після рестарту)"
         lines = _build_periodic_report_lines(
             header, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
             perm_ips, perm_subnets, single_count, single_alerts, top, "слот",
             new_ips_list=new_ips_list, new_subnets_list=new_subnets_list,
+            perm_ips_list=perm_ips_list, perm_subnets_list=perm_subnets_list,
         )
         sent_ok = telegram_send("\n".join(lines))
         if sent_ok:
@@ -962,10 +1029,13 @@ def _reset_slot_state(new_slot: int) -> None:
     _slot_inbound_subnets.clear()
     _slot_new_ips.clear()
     _slot_new_subnets.clear()
+    _slot_perm_ips_list.clear()
+    _slot_perm_subnets_list.clear()
 
 
 def _reset_daily_state(new_day: str) -> None:
     global _digest_day, _daily_permanent_ips_count, _daily_permanent_subnets_count
+    old_day = _digest_day
     _digest_day = new_day
     _daily_permanent_ips_count = 0
     _daily_permanent_subnets_count = 0
@@ -974,6 +1044,12 @@ def _reset_daily_state(new_day: str) -> None:
     _daily_outbound_counts.clear()
     _daily_new_ips.clear()
     _daily_new_subnets.clear()
+    _daily_permanent_ips_list.clear()
+    _daily_permanent_subnets_list.clear()
+    # subnet_daily_ips only needs to cover "today" (see _subnet_daily_ips docstring) —
+    # drop the completed day's rows in-memory and on disk now that it's over.
+    _subnet_daily_ips.clear()
+    _conn.execute("DELETE FROM subnet_daily_ips WHERE day=?", (old_day,))
 
 
 def check_spike(now: float) -> None:
@@ -1015,6 +1091,7 @@ def reconcile_slot_blocks() -> None:
             _permanently_blocked_ips.add(ip)
             db_record_permanent_block(ip, "ip", "slot-reconcile")
             _daily_permanent_ips_count += 1
+            _daily_permanent_ips_list.add(ip)
             newly_blocked_ips.append((ip, cnt))
         print(f"slot-reconcile ip={ip} hits={cnt} blocked={blocked}", flush=True)
 
@@ -1027,6 +1104,7 @@ def reconcile_slot_blocks() -> None:
             _permanently_blocked_subnets.add(subnet_str)
             db_record_permanent_block(subnet_str, "subnet", "slot-reconcile")
             _daily_permanent_subnets_count += 1
+            _daily_permanent_subnets_list.add(subnet_str)
             newly_blocked_subnets.append((subnet_str, unique_ips, info["alerts"]))
         print(f"slot-reconcile subnet={subnet_str} unique_ips={unique_ips} blocked={blocked}", flush=True)
 
@@ -1177,6 +1255,8 @@ def main() -> None:
                         db_record_permanent_block(subnet_str, "subnet", sig)
                         _slot_perm_subnets_count += 1
                         _daily_permanent_subnets_count += 1
+                        _slot_perm_subnets_list.add(subnet_str)
+                        _daily_permanent_subnets_list.add(subnet_str)
                     print(f"subnet-block {sig} subnet={subnet_str} unique_ips={subnet_alltime_cnt} "
                           f"active_days={len(_subnet_active_days[subnet_str])} permanent=True blocked={blocked_sub}",
                           flush=True)
@@ -1217,6 +1297,8 @@ def main() -> None:
                             db_record_permanent_block(target_ip, "ip", sig)
                             _slot_perm_ips_count += 1
                             _daily_permanent_ips_count += 1
+                            _slot_perm_ips_list.add(target_ip)
+                            _daily_permanent_ips_list.add(target_ip)
                         print(f"inbound-alert {sig} attacker={target_ip} attempts={attempts} "
                               f"not-on-router blocked={blocked_retry}", flush=True)
                     continue
@@ -1232,6 +1314,8 @@ def main() -> None:
                     db_record_permanent_block(target_ip, "ip", sig)
                     _slot_perm_ips_count += 1
                     _daily_permanent_ips_count += 1
+                    _slot_perm_ips_list.add(target_ip)
+                    _daily_permanent_ips_list.add(target_ip)
 
                 print(f"inbound-alert {sig} attacker={target_ip} attempts={attempts} "
                       f"permanent={permanent} blocked={blocked}", flush=True)

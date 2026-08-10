@@ -10,7 +10,8 @@ Reads /var/log/suricata/alert_bridge.db directly (no journal parsing):
                         tell noisy-but-unblocked subnets apart from ones already handled.
   --list                With --sum/--day: also print actual new-IP/new-subnet/permanently-blocked
                         addresses (not just counts). Terminal preview is capped per group.
-  --list-out FILE       With --list: write the full, untruncated address lists to FILE.
+  --list-out FILE       Write the full, untruncated address lists to FILE (implies --list;
+                        with --sum/--day).
   --sync-mikrotik       Block /24 subnets with >= MIN unique IPs all-time on MikroTik.
                         Subnets already recorded in permanent_blocks are skipped for the
                         block step (no repeat PUT) but still get their redundant single-IP
@@ -833,7 +834,9 @@ def main():
                         help="With --sum/--day: also print actual new-IP/new-subnet/permanently-blocked "
                              f"addresses, not just counts (terminal preview capped at {LIST_PREVIEW_LIMIT}/group)")
     parser.add_argument("--list-out", metavar="FILE",
-                        help="With --list: write the FULL address lists to FILE instead of truncating them")
+                        help="Write the FULL new-IP/new-subnet/permanently-blocked address lists to "
+                             "FILE instead of truncating them in the terminal preview (implies --list, "
+                             "with --sum/--day)")
     parser.add_argument("--min-ips", type=int, default=DEFAULT_MIN_IPS,
                         help=f"Min unique IPs per subnet for --sync-mikrotik "
                              f"(default: {DEFAULT_MIN_IPS}, from alert-bridge.cfg [blocking] subnet_threshold)")
@@ -849,6 +852,8 @@ def main():
                         help="With --verify-blocks: re-add every genuinely-missing entry "
                              "(IPs and subnets alike) back onto the live MikroTik list")
     args = parser.parse_args()
+    if args.list_out and not args.list:
+        args.list = True
 
     conn = connect_db()
     if conn is None:
