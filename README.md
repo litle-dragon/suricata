@@ -241,6 +241,101 @@ threshold-file: /etc/suricata/threshold.config
 The result: just two logs. `fast.log` (one alert per line, human-readable)
 and `eve.json` (the same alerts as structured JSON — the bridge needs it).
 
+## Step 4b — Geo/Spamhaus dataset blocking (optional)
+
+Blocks entire countries (RU/BY/CN/KP/IR by default) and the
+[Spamhaus DROP](https://www.spamhaus.org/drop/drop.txt) list of hijacked/
+spam-hosting networks — tens of thousands of CIDR ranges, too many to push
+into MikroTik's address-lists directly without eating router memory.
+Instead they're loaded as Suricata **datasets** (a fast lookup structure
+built for exactly this), and only actual **hits** get pushed to MikroTik —
+the same offload pattern the alert bridge already uses for ET signatures.
+See `docs/adr/0001-suricata-dataset-offload-for-geo-spamhaus-blocking.md`
+and `docs/adr/0002-geo-spamhaus-parallel-pipeline.md` for the reasoning.
+
+**1. Create the dataset directory and rule file:**
+
+```bash
+sudo mkdir -p /var/lib/suricata/datasets
+sudo curl -o /etc/suricata/rules/geo-spamhaus.rules \
+  https://raw.githubusercontent.com/litle-dragon/suricata/main/geo-spamhaus.rules
+```
+
+**2. Register the datasets in `suricata.yaml`** — add a `datasets:` block
+(one entry per country plus Spamhaus; edit the country list to match
+`[geo_spamhaus] countries` in `alert-bridge.cfg`):
+
+```yaml
+datasets:
+  geo_ru: {type: ip, load: /var/lib/suricata/datasets/geo_ru.lst}
+  geo_by: {type: ip, load: /var/lib/suricata/datasets/geo_by.lst}
+  geo_cn: {type: ip, load: /var/lib/suricata/datasets/geo_cn.lst}
+  geo_kp: {type: ip, load: /var/lib/suricata/datasets/geo_kp.lst}
+  geo_ir: {type: ip, load: /var/lib/suricata/datasets/geo_ir.lst}
+  spamhaus: {type: ip, load: /var/lib/suricata/datasets/spamhaus.lst}
+```
+
+And add the new rule file to `rule-files:` alongside the ET ruleset:
+
+```yaml
+rule-files:
+  - suricata.rules
+  - geo-spamhaus.rules
+```
+
+**3. Install and schedule `update_geo_lists.py`** — fetches
+[iwik.org](https://www.iwik.org/ipcountry/geoip.txt) (filtered to the
+configured countries) and the Spamhaus DROP list, writes the `.lst` files
+above atomically, and triggers a live `suricatasc -c reload-rules` (no
+Suricata restart). On a fetch failure for either source it leaves
+yesterday's file untouched and sends a Telegram warning instead of blanking
+the list:
+
+```bash
+sudo curl -o /opt/alert-bridge/update_geo_lists.py \
+  https://raw.githubusercontent.com/litle-dragon/suricata/main/update_geo_lists.py
+sudo curl -o /opt/alert-bridge/geo_lists.py \
+  https://raw.githubusercontent.com/litle-dragon/suricata/main/geo_lists.py
+sudo python3 /opt/alert-bridge/update_geo_lists.py   # first run — populates the .lst files
+```
+
+```bash
+echo -e '#!/bin/sh\nCFG_FILE=/opt/alert-bridge/alert-bridge.cfg ENV_FILE=/opt/alert-bridge/env python3 /opt/alert-bridge/update_geo_lists.py' | sudo tee /etc/cron.daily/update-geo-lists
+sudo chmod +x /etc/cron.daily/update-geo-lists
+```
+
+**4. Add the `[geo_spamhaus]` section** to `/opt/alert-bridge/alert-bridge.cfg`
+(see `alert-bridge.cfg.example` for every key + default) and restart the
+bridge so `geo_lists.py`/`classify_category()` pick up the new config:
+
+```bash
+sudo systemctl restart alert-bridge
+```
+
+**5. MikroTik firewall rules** — two more permanent, no-timeout RAW drop
+rules, one per category list (`suricata-geo-block` / `suricata-spamhaus-block`),
+analogous to the `suricata-block` rule from Step 8c. IPv4 only — geo/Spamhaus
+blocking deliberately doesn't cover IPv6 (see CONTEXT.md "Діапазон"):
+
+```routeros
+# For Single WAN (e.g. WAN2):
+/ip firewall raw add chain=prerouting in-interface=WAN2 \
+    src-address-list=suricata-geo-block action=drop comment="Suricata geo-block"
+/ip firewall raw add chain=prerouting in-interface=WAN2 \
+    src-address-list=suricata-spamhaus-block action=drop comment="Suricata Spamhaus-block"
+
+# For Dual WAN (reuse the WAN-LIST interface list from Step 8c):
+/ip firewall raw add chain=prerouting in-interface-list=WAN-LIST \
+    src-address-list=suricata-geo-block action=drop comment="Suricata geo-block"
+/ip firewall raw add chain=prerouting in-interface-list=WAN-LIST \
+    src-address-list=suricata-spamhaus-block action=drop comment="Suricata Spamhaus-block"
+```
+
+From here, a GEO-BLOCK-\*/SPAMHAUS-BLOCK-\* alert is blocked on MikroTik
+immediately and permanently on its first hit — no escalation, no cooldown
+(see `docs/adr/0002-...`). Country/Spamhaus breakdowns show up in the 6-hour
+digest, the 07:00 report, and `analyze_stats.py --geo`.
+
 ## Step 5 — Install the rules and verify
 
 Download the free Emerging Threats Open ruleset (~50k signatures, refreshed

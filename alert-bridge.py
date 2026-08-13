@@ -53,6 +53,8 @@ from collections import defaultdict
 import requests
 import urllib3
 
+import geo_lists
+
 urllib3.disable_warnings()  # self-signed cert on the router's www-ssl
 
 CFG_FILE = os.environ.get("CFG_FILE", "/opt/alert-bridge/alert-bridge.cfg")
@@ -193,6 +195,8 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     new_subnets_json TEXT DEFAULT '[]',
     perm_ips_json TEXT DEFAULT '[]',
     perm_subnets_json TEXT DEFAULT '[]',
+    geo_counts_json TEXT DEFAULT '{}',
+    spamhaus_count INTEGER DEFAULT 0,
     sent INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -216,6 +220,8 @@ CREATE TABLE IF NOT EXISTS slot_digests (
     new_subnets_json TEXT DEFAULT '[]',
     perm_ips_json TEXT DEFAULT '[]',
     perm_subnets_json TEXT DEFAULT '[]',
+    geo_counts_json TEXT DEFAULT '{}',
+    spamhaus_count INTEGER DEFAULT 0,
     sent INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -266,6 +272,10 @@ _SCHEMA_MIGRATIONS = [
     ("daily_stats", "perm_subnets_json", "TEXT DEFAULT '[]'"),
     ("slot_digests", "perm_ips_json", "TEXT DEFAULT '[]'"),
     ("slot_digests", "perm_subnets_json", "TEXT DEFAULT '[]'"),
+    ("daily_stats", "geo_counts_json", "TEXT DEFAULT '{}'"),
+    ("daily_stats", "spamhaus_count", "INTEGER DEFAULT 0"),
+    ("slot_digests", "geo_counts_json", "TEXT DEFAULT '{}'"),
+    ("slot_digests", "spamhaus_count", "INTEGER DEFAULT 0"),
 ]
 
 # ── In-memory hot state ───────────────────────────────────────────────────────
@@ -309,6 +319,8 @@ _slot_perm_ips_count = 0
 _slot_perm_subnets_count = 0
 _slot_perm_ips_list: set[str] = set()
 _slot_perm_subnets_list: set[str] = set()
+_slot_geo_counts: dict[str, int] = {}
+_slot_spamhaus_count = 0
 
 # Daily counters (reset at midnight)
 _digest_day = time.strftime("%Y-%m-%d")
@@ -321,6 +333,8 @@ _daily_permanent_ips_count = 0
 _daily_permanent_subnets_count = 0
 _daily_permanent_ips_list: set[str] = set()
 _daily_permanent_subnets_list: set[str] = set()
+_daily_geo_counts: dict[str, int] = {}
+_daily_spamhaus_count = 0
 
 _last_7am_report_date = ""
 
@@ -520,6 +534,27 @@ def classify_flow(ev: dict) -> tuple[str, str, str]:
         return ("inbound", src, dest) if not src_home else ("outbound", dest, src)
 
 
+_GEO_PREFIX = "GEO-BLOCK-"            # GEO-BLOCK-<CC>-IN / GEO-BLOCK-<CC>-OUT
+_SPAMHAUS_PREFIX = "SPAMHAUS-BLOCK-"  # SPAMHAUS-BLOCK-IN / SPAMHAUS-BLOCK-OUT
+
+
+def classify_category(sig: str) -> tuple[str, str | None] | None:
+    """Parses a Suricata alert signature against the geo/Spamhaus rule-naming
+    convention (geo-spamhaus.rules, docs/adr/0001-...) and returns the block
+    category, or None for every ordinary ET signature (unchanged path).
+    Returns ("geo", "<cc-lower>") or ("spamhaus", None)."""
+    if sig.startswith(_GEO_PREFIX):
+        rest = sig[len(_GEO_PREFIX):]
+        cc, _, suffix = rest.rpartition("-")
+        if suffix in ("IN", "OUT") and cc.lower() in geo_lists.COUNTRIES:
+            return "geo", cc.lower()
+        return None
+    if sig.startswith(_SPAMHAUS_PREFIX):
+        suffix = sig[len(_SPAMHAUS_PREFIX):]
+        return ("spamhaus", None) if suffix in ("IN", "OUT") else None
+    return None
+
+
 def cooled_down(key: str) -> bool:
     now = time.time()
     if now - _recent.get(key, 0) < COOLDOWN:
@@ -557,7 +592,7 @@ def telegram_send(text: str) -> bool:
         return False
 
 
-def mikrotik_lookup_covered(ip: str) -> str:
+def mikrotik_lookup_covered(ip: str, block_list: str = BLOCK_LIST) -> str:
     """
     Queries the live MikroTik block list for `ip`.
     Returns "ip" if the exact address is listed, "subnet" if a covering
@@ -574,7 +609,7 @@ def mikrotik_lookup_covered(ip: str) -> str:
     base_url = f"https://{MT_HOST}/rest/{family}/firewall/address-list"
     auth = (MT_USER, MT_PASS)
     try:
-        r = requests.get(f"{base_url}?list={BLOCK_LIST}", auth=auth, verify=False, timeout=(5, 10))
+        r = requests.get(f"{base_url}?list={block_list}", auth=auth, verify=False, timeout=(5, 10))
         if r.status_code != 200:
             print(f"mikrotik lookup {ip}: HTTP {r.status_code} resp={r.text[:200]!r}, treating as absent", flush=True)
             return "absent"
@@ -597,7 +632,7 @@ def mikrotik_lookup_covered(ip: str) -> str:
         return "absent"
 
 
-def mikrotik_block(ip_or_subnet: str, signature: str, permanent: bool = False) -> bool:
+def mikrotik_block(ip_or_subnet: str, signature: str, permanent: bool = False, block_list: str = BLOCK_LIST) -> bool:
     try:
         net = ipaddress.ip_network(ip_or_subnet, strict=False)
         family = "ipv6" if net.version == 6 else "ip"
@@ -619,7 +654,7 @@ def mikrotik_block(ip_or_subnet: str, signature: str, permanent: bool = False) -
     # already permanently blocked.
     try:
         r_get = requests.get(
-            f"{base_url}?list={BLOCK_LIST}&address={ip_or_subnet}",
+            f"{base_url}?list={block_list}&address={ip_or_subnet}",
             auth=auth,
             verify=False,
             timeout=(5, 10),
@@ -643,7 +678,7 @@ def mikrotik_block(ip_or_subnet: str, signature: str, permanent: bool = False) -
         print(f"mikrotik lookup/delete failed for {ip_or_subnet}: {e}", flush=True)
 
     body = {
-        "list": BLOCK_LIST,
+        "list": block_list,
         "address": ip_or_subnet,
         "comment": (comment_prefix + signature)[:60],
     }
@@ -731,7 +766,9 @@ def _build_periodic_report_lines(header: str, total: int, new_ips: int, new_subn
                                   new_ips_list: list[str] | None = None,
                                   new_subnets_list: list[str] | None = None,
                                   perm_ips_list: list[str] | None = None,
-                                  perm_subnets_list: list[str] | None = None) -> list[str]:
+                                  perm_subnets_list: list[str] | None = None,
+                                  geo_counts: dict[str, int] | None = None,
+                                  spamhaus_count: int = 0) -> list[str]:
     """Shared body for the 6h slot digest and the 07:00 daily report — both the
     live senders and resend_missed_reports() build from this so the two paths
     can never drift apart.
@@ -761,6 +798,11 @@ def _build_periodic_report_lines(header: str, total: int, new_ips: int, new_subn
     lines.append(f"• Додано в постійний блок підмереж за {period_label}: {perm_subnets:,}")
     if perm_subnets_list and perm_subnets < NEW_ADDR_LIST_THRESHOLD:
         lines += [f"    - {net}" for net in perm_subnets_list]
+    if geo_counts and any(geo_counts.values()):
+        geo_parts = [f"{cc.upper()}={geo_counts.get(cc, 0)}" for cc in geo_lists.COUNTRIES]
+        lines.append(f"🌍 Geo-block: {', '.join(geo_parts)}")
+    if spamhaus_count:
+        lines.append(f"🚫 Spamhaus-block: {spamhaus_count:,}")
     lines.append("")
     if top:
         lines += _format_top_lines(top)
@@ -828,6 +870,8 @@ def send_6h_slot_digest(slot_index: int, day: str) -> None:
     new_subnets_list = sorted(_slot_new_subnets) if new_subnets < NEW_ADDR_LIST_THRESHOLD else []
     perm_ips_list = sorted(_slot_perm_ips_list) if _slot_perm_ips_count < NEW_ADDR_LIST_THRESHOLD else []
     perm_subnets_list = sorted(_slot_perm_subnets_list) if _slot_perm_subnets_count < NEW_ADDR_LIST_THRESHOLD else []
+    geo_counts = {cc: _slot_geo_counts.get(cc, 0) for cc in geo_lists.COUNTRIES}
+    spamhaus_count = _slot_spamhaus_count
 
     header = f"📊 6-годинний дайджест нових загроз\nПеріод: {start} - {end} ({day})"
     lines = _build_periodic_report_lines(
@@ -835,6 +879,7 @@ def send_6h_slot_digest(slot_index: int, day: str) -> None:
         _slot_perm_ips_count, _slot_perm_subnets_count, single_count, single_alerts,
         top, "6 годин", new_ips_list=new_ips_list, new_subnets_list=new_subnets_list,
         perm_ips_list=perm_ips_list, perm_subnets_list=perm_subnets_list,
+        geo_counts=geo_counts, spamhaus_count=spamhaus_count,
     )
 
     sent_ok = telegram_send("\n".join(lines))
@@ -842,12 +887,14 @@ def send_6h_slot_digest(slot_index: int, day: str) -> None:
         "INSERT INTO slot_digests(date, slot_index, start_time, end_time, total_alerts, "
         "new_ips_count, new_subnets_count, avg_alerts_per_ip, avg_alerts_per_subnet, "
         "perm_ips_count, perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json, "
-        "new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json, sent) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json, "
+        "geo_counts_json, spamhaus_count, sent) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (day, slot_index, start, end, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
          _slot_perm_ips_count, _slot_perm_subnets_count, single_count, single_alerts, json.dumps(top),
          json.dumps(new_ips_list), json.dumps(new_subnets_list),
-         json.dumps(perm_ips_list), json.dumps(perm_subnets_list), int(sent_ok)),
+         json.dumps(perm_ips_list), json.dumps(perm_subnets_list),
+         json.dumps(geo_counts), spamhaus_count, int(sent_ok)),
     )
     print(f"slot-digest slot={slot_index} {start}-{end} total={total} new_ips={new_ips} sent={sent_ok}",
           flush=True)
@@ -868,17 +915,20 @@ def snapshot_daily_stats(day: str) -> None:
     new_subnets_list = sorted(_daily_new_subnets) if new_subnets < NEW_ADDR_LIST_THRESHOLD else []
     perm_ips_list = sorted(_daily_permanent_ips_list) if _daily_permanent_ips_count < NEW_ADDR_LIST_THRESHOLD else []
     perm_subnets_list = sorted(_daily_permanent_subnets_list) if _daily_permanent_subnets_count < NEW_ADDR_LIST_THRESHOLD else []
+    geo_counts = {cc: _daily_geo_counts.get(cc, 0) for cc in geo_lists.COUNTRIES}
 
     _conn.execute(
         "INSERT OR REPLACE INTO daily_stats(date, total_alerts, unique_ips, unique_subnets, "
         "new_ips_count, new_subnets_count, avg_alerts_per_ip, avg_alerts_per_subnet, "
         "perm_ips_count, perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json, "
-        "new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json, sent) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+        "new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json, "
+        "geo_counts_json, spamhaus_count, sent) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
         (day, total, unique_ips, unique_subnets, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
          _daily_permanent_ips_count, _daily_permanent_subnets_count, single_count, single_alerts,
          json.dumps(top), json.dumps(new_ips_list), json.dumps(new_subnets_list),
-         json.dumps(perm_ips_list), json.dumps(perm_subnets_list)),
+         json.dumps(perm_ips_list), json.dumps(perm_subnets_list),
+         json.dumps(geo_counts), _daily_spamhaus_count),
     )
     print(f"daily-snapshot {day} total={total} unique_ips={unique_ips} new_ips={new_ips}", flush=True)
 
@@ -890,7 +940,7 @@ def send_7am_daily_report() -> None:
         "SELECT date, total_alerts, new_ips_count, new_subnets_count, avg_alerts_per_ip, "
         "avg_alerts_per_subnet, perm_ips_count, perm_subnets_count, single_ips_count, "
         "single_ips_alerts, top_subnets_json, new_ips_json, new_subnets_json, "
-        "perm_ips_json, perm_subnets_json "
+        "perm_ips_json, perm_subnets_json, geo_counts_json, spamhaus_count "
         "FROM daily_stats WHERE date=?",
         (yesterday,),
     ).fetchone()
@@ -900,12 +950,14 @@ def send_7am_daily_report() -> None:
 
     (day, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
      perm_ips, perm_subnets, single_count, single_alerts, top_json,
-     new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json) = row
+     new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json,
+     geo_counts_json, spamhaus_count) = row
     top = json.loads(top_json)
     new_ips_list = json.loads(new_ips_json) if new_ips_json else []
     new_subnets_list = json.loads(new_subnets_json) if new_subnets_json else []
     perm_ips_list = json.loads(perm_ips_json) if perm_ips_json else []
     perm_subnets_list = json.loads(perm_subnets_json) if perm_subnets_json else []
+    geo_counts = json.loads(geo_counts_json) if geo_counts_json else {}
 
     header = f"🌅 Звіт за попередній день ({day}) 📊"
     lines = _build_periodic_report_lines(
@@ -913,6 +965,7 @@ def send_7am_daily_report() -> None:
         perm_ips, perm_subnets, single_count, single_alerts, top, "добу",
         new_ips_list=new_ips_list, new_subnets_list=new_subnets_list,
         perm_ips_list=perm_ips_list, perm_subnets_list=perm_subnets_list,
+        geo_counts=geo_counts, spamhaus_count=spamhaus_count or 0,
     )
 
     sent_ok = telegram_send("\n".join(lines))
@@ -938,24 +991,27 @@ def resend_missed_reports() -> None:
         "SELECT date, total_alerts, new_ips_count, new_subnets_count, avg_alerts_per_ip, "
         "avg_alerts_per_subnet, perm_ips_count, perm_subnets_count, single_ips_count, "
         "single_ips_alerts, top_subnets_json, new_ips_json, new_subnets_json, "
-        "perm_ips_json, perm_subnets_json "
+        "perm_ips_json, perm_subnets_json, geo_counts_json, spamhaus_count "
         "FROM daily_stats WHERE sent=0 AND date>=? ORDER BY date",
         (cutoff,),
     ).fetchall():
         (day, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
          perm_ips, perm_subnets, single_count, single_alerts, top_json,
-         new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json) = row
+         new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json,
+         geo_counts_json, spamhaus_count) = row
         top = json.loads(top_json)
         new_ips_list = json.loads(new_ips_json) if new_ips_json else []
         new_subnets_list = json.loads(new_subnets_json) if new_subnets_json else []
         perm_ips_list = json.loads(perm_ips_json) if perm_ips_json else []
         perm_subnets_list = json.loads(perm_subnets_json) if perm_subnets_json else []
+        geo_counts = json.loads(geo_counts_json) if geo_counts_json else {}
         header = f"🌅 Звіт за {day} (повторна відправка після рестарту) 📊"
         lines = _build_periodic_report_lines(
             header, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
             perm_ips, perm_subnets, single_count, single_alerts, top, "добу",
             new_ips_list=new_ips_list, new_subnets_list=new_subnets_list,
             perm_ips_list=perm_ips_list, perm_subnets_list=perm_subnets_list,
+            geo_counts=geo_counts, spamhaus_count=spamhaus_count or 0,
         )
         sent_ok = telegram_send("\n".join(lines))
         if sent_ok:
@@ -967,24 +1023,28 @@ def resend_missed_reports() -> None:
         "SELECT id, date, slot_index, start_time, end_time, total_alerts, new_ips_count, "
         "new_subnets_count, avg_alerts_per_ip, avg_alerts_per_subnet, perm_ips_count, "
         "perm_subnets_count, single_ips_count, single_ips_alerts, top_subnets_json, "
-        "new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json "
+        "new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json, "
+        "geo_counts_json, spamhaus_count "
         "FROM slot_digests WHERE sent=0 AND date>=? ORDER BY date, slot_index",
         (cutoff,),
     ).fetchall():
         (rid, day, slot_index, start, end, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
          perm_ips, perm_subnets, single_count, single_alerts, top_json,
-         new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json) = row
+         new_ips_json, new_subnets_json, perm_ips_json, perm_subnets_json,
+         geo_counts_json, spamhaus_count) = row
         top = json.loads(top_json)
         new_ips_list = json.loads(new_ips_json) if new_ips_json else []
         new_subnets_list = json.loads(new_subnets_json) if new_subnets_json else []
         perm_ips_list = json.loads(perm_ips_json) if perm_ips_json else []
         perm_subnets_list = json.loads(perm_subnets_json) if perm_subnets_json else []
+        geo_counts = json.loads(geo_counts_json) if geo_counts_json else {}
         header = f"📊 6-годинний дайджест {start} - {end} ({day}) (повторна відправка після рестарту)"
         lines = _build_periodic_report_lines(
             header, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
             perm_ips, perm_subnets, single_count, single_alerts, top, "слот",
             new_ips_list=new_ips_list, new_subnets_list=new_subnets_list,
             perm_ips_list=perm_ips_list, perm_subnets_list=perm_subnets_list,
+            geo_counts=geo_counts, spamhaus_count=spamhaus_count or 0,
         )
         sent_ok = telegram_send("\n".join(lines))
         if sent_ok:
@@ -1021,24 +1081,29 @@ def resend_missed_reports() -> None:
 
 def _reset_slot_state(new_slot: int) -> None:
     global _slot_index, _slot_alerts_count, _slot_perm_ips_count, _slot_perm_subnets_count
+    global _slot_spamhaus_count
     _slot_index = new_slot
     _slot_alerts_count = 0
     _slot_perm_ips_count = 0
     _slot_perm_subnets_count = 0
+    _slot_spamhaus_count = 0
     _slot_inbound_counts.clear()
     _slot_inbound_subnets.clear()
     _slot_new_ips.clear()
     _slot_new_subnets.clear()
     _slot_perm_ips_list.clear()
     _slot_perm_subnets_list.clear()
+    _slot_geo_counts.clear()
 
 
 def _reset_daily_state(new_day: str) -> None:
     global _digest_day, _daily_permanent_ips_count, _daily_permanent_subnets_count
+    global _daily_spamhaus_count
     old_day = _digest_day
     _digest_day = new_day
     _daily_permanent_ips_count = 0
     _daily_permanent_subnets_count = 0
+    _daily_spamhaus_count = 0
     _daily_inbound_counts.clear()
     _daily_inbound_subnets.clear()
     _daily_outbound_counts.clear()
@@ -1046,7 +1111,8 @@ def _reset_daily_state(new_day: str) -> None:
     _daily_new_subnets.clear()
     _daily_permanent_ips_list.clear()
     _daily_permanent_subnets_list.clear()
-    # subnet_daily_ips only needs to cover "today" (see _subnet_daily_ips docstring) —
+    _daily_geo_counts.clear()
+    # subnet_daily_ips only needs to cover "today" (see _subnet_daily_ips docstring) --
     # drop the completed day's rows in-memory and on disk now that it's over.
     _subnet_daily_ips.clear()
     _conn.execute("DELETE FROM subnet_daily_ips WHERE day=?", (old_day,))
@@ -1188,7 +1254,7 @@ def follow(path: str):
 
 def main() -> None:
     global _last_7am_report_date, _daily_permanent_ips_count, _daily_permanent_subnets_count
-    global _slot_perm_ips_count, _slot_perm_subnets_count
+    global _slot_perm_ips_count, _slot_perm_subnets_count, _slot_spamhaus_count, _daily_spamhaus_count
     db_init()
     # Startup guard: if we boot after 07:00, don't re-fire yesterday's report on every restart.
     if int(time.strftime("%H")) >= 7:
@@ -1222,6 +1288,32 @@ def main() -> None:
 
             sig = alert.get("signature", "")
             now = time.time()
+
+            category = classify_category(sig)
+            if category is not None:
+                kind, cc = category
+                list_name = f"geo_{cc}" if kind == "geo" else "spamhaus"
+                covering = geo_lists.covering_range(list_name, target_ip)
+                addr = covering or target_ip
+                already_blocked = addr in _permanently_blocked_ips or addr in _permanently_blocked_subnets
+                db_kind = f"geo-{cc}" if kind == "geo" else "spamhaus"
+                if not already_blocked:
+                    block_list = geo_lists.MIKROTIK_GEO_LIST if kind == "geo" else geo_lists.MIKROTIK_SPAMHAUS_LIST
+                    blocked = mikrotik_block(addr, sig, permanent=True, block_list=block_list)
+                    if blocked:
+                        if covering:
+                            _permanently_blocked_subnets.add(addr)
+                        else:
+                            _permanently_blocked_ips.add(addr)
+                        db_record_permanent_block(addr, db_kind, sig)
+                    print(f"{db_kind}-alert {sig} addr={addr} blocked={blocked}", flush=True)
+                if kind == "geo":
+                    _slot_geo_counts[cc] = _slot_geo_counts.get(cc, 0) + 1
+                    _daily_geo_counts[cc] = _daily_geo_counts.get(cc, 0) + 1
+                else:
+                    _slot_spamhaus_count += 1
+                    _daily_spamhaus_count += 1
+                continue
 
             if direction == "inbound":
                 attempts, subnet_str, subnet_alltime_cnt, subnet_multiday_qualified = record_hit("inbound", target_ip, sig)

@@ -85,3 +85,28 @@ resend_lookback_days = 3
 # analyze_stats.py --list/--list-out for the full historical list).
 # (default: 10)
 new_addr_list_threshold = 10
+
+[geo_spamhaus]
+# Master switch for geo/Spamhaus dataset blocking (docs/adr/0001, docs/adr/0002).
+# When false, alert-bridge.py never reads this section further -- classify_category()
+# still parses signatures, but the block is meaningless if update_geo_lists.py was
+# never set up (no .lst files under dataset_dir). (default: true)
+enabled = true
+
+# ISO 3166-1 alpha-2 country codes to block via Suricata geo datasets, comma-
+# separated. Each gets its own `geo_<cc>.lst` dataset file and a pair of
+# GEO-BLOCK-<CC>-IN/OUT rules in geo-spamhaus.rules. (default: RU,BY,CN,KP,IR)
+countries = RU,BY,CN,KP,IR
+
+# Directory on the Suricata box holding the `.lst` dataset source files that
+# both Suricata (suricata.yaml `datasets:`) and alert-bridge.py's local
+# "covering range" lookup (geo_lists.py) read from. update_geo_lists.py writes
+# here daily. (default: /var/lib/suricata/datasets)
+dataset_dir = /var/lib/suricata/datasets
+
+# MikroTik firewall address-list names that geo/Spamhaus hits are written to --
+# separate from block_list above so these can get their own (permanent, no-
+# timeout) firewall drop rule on the router. (defaults: suricata-geo-block /
+# suricata-spamhaus-block)
+mikrotik_geo_list = suricata-geo-block
+mikrotik_spamhaus_list = suricata-spamhaus-block

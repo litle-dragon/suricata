@@ -263,6 +263,32 @@ def cmd_day(conn: sqlite3.Connection, day: str, show_list: bool = False, out_fh=
     _jlog(f"--day {day}: {r['total_alerts']} alerts, {r['perm_ips_count']} perm IPs, {r['perm_subnets_count']} perm subnets")
 
 
+def cmd_geo(conn: sqlite3.Connection):
+    """Breakdown of permanent geo/Spamhaus blocks, grouped by kind -- separate
+    from --sum/--top (docs/adr/0002: geo/Spamhaus is its own parallel
+    pipeline, never touches the ordinary 'ip'/'subnet' permanent_blocks rows
+    or seen_ips/seen_subnets uniqueness)."""
+    rows = list(conn.execute(
+        "SELECT kind, COUNT(*) as cnt, MIN(blocked_at) as first_blocked, MAX(blocked_at) as last_blocked "
+        "FROM permanent_blocks WHERE kind LIKE 'geo-%' OR kind='spamhaus' "
+        "GROUP BY kind ORDER BY kind"
+    ))
+    if not rows:
+        print("No geo/Spamhaus permanent blocks recorded yet.")
+        return
+    print("\n🌍 Geo / Spamhaus permanent blocks")
+    print("=" * 70)
+    total = 0
+    for r in rows:
+        label = r["kind"][len("geo-"):].upper() if r["kind"].startswith("geo-") else "Spamhaus"
+        print(f"{label:<12} | {r['cnt']:>6,} blocks | first {r['first_blocked']} | last {r['last_blocked']}")
+        total += r["cnt"]
+    print("-" * 70)
+    print(f"Total: {total:,} permanent geo/Spamhaus blocks")
+    print("=" * 70)
+    _jlog(f"--geo: {total} geo/spamhaus permanent blocks across {len(rows)} kinds")
+
+
 def cmd_spikes(conn: sqlite3.Connection):
     rows = list(conn.execute(
         "SELECT timestamp, start_time, end_time, total_alerts, avg_rate_per_min, unique_ips "
@@ -830,6 +856,9 @@ def main():
     parser.add_argument("--day", metavar="YYYY-MM-DD", help="Full breakdown for one day")
     parser.add_argument("--spikes", action="store_true", help="Log of all anomaly spike alerts")
     parser.add_argument("--top", type=int, metavar="N", help="Top N attacker subnets and IPs all-time")
+    parser.add_argument("--geo", action="store_true",
+                        help="Breakdown of permanent geo/Spamhaus blocks by country "
+                             "(kind LIKE 'geo-%%' OR kind='spamhaus'), separate from --sum/--top")
     parser.add_argument("--list", action="store_true",
                         help="With --sum/--day: also print actual new-IP/new-subnet/permanently-blocked "
                              f"addresses, not just counts (terminal preview capped at {LIST_PREVIEW_LIMIT}/group)")
@@ -874,6 +903,9 @@ def main():
             did_something = True
         if args.top:
             cmd_top(conn, args.top)
+            did_something = True
+        if args.geo:
+            cmd_geo(conn)
             did_something = True
         if args.sync_mikrotik:
             subnets = aggregate_seen_subnets(conn, min_ips=args.min_ips)
