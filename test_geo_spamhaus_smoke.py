@@ -34,7 +34,7 @@ with open(CFG_PATH, "w") as f:
         "[geo_spamhaus]\n"
         "enabled = true\n"
         "countries = RU,BY\n"
-        f"dataset_dir = {DATASET_DIR}\n"
+        f"local_lists_dir = {DATASET_DIR}\n"
         "mikrotik_geo_list = suricata-geo-block\n"
         "mikrotik_spamhaus_list = suricata-spamhaus-block\n"
     )

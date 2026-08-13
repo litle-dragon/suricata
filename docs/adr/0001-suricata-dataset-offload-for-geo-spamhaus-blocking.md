@@ -1,6 +1,6 @@
 # Suricata dataset matching замість прямого завантаження geo/Spamhaus списків у MikroTik
 
-**Статус:** accepted
+**Статус:** superseded by [0003-ip-reputation-not-datasets-for-geo-spamhaus-cidr-matching.md](0003-ip-reputation-not-datasets-for-geo-spamhaus-cidr-matching.md)
 
 Geo-блокування (RU, BY, CN, KP, IR) і Spamhaus DROP — великі списки CIDR-діапазонів (geoip.txt: ~26k рядків усі країни; Spamhaus DROP: ~1.7k). Замість завантаження цих списків цілком у MikroTik firewall address-lists (постійне навантаження на пам'ять роутера), списки завантажуються як Suricata `dataset` (IPv4-only, окремий dataset-файл на країну + окремий на Spamhaus, окреме правило на кожен напрямок), а на MikroTik пушаться лише **фактичні хіти** — той самий патерн, що вже працює для ET-сигнатур через `alert-bridge.py`.
 

@@ -241,43 +241,45 @@ threshold-file: /etc/suricata/threshold.config
 The result: just two logs. `fast.log` (one alert per line, human-readable)
 and `eve.json` (the same alerts as structured JSON — the bridge needs it).
 
-## Step 4b — Geo/Spamhaus dataset blocking (optional)
+## Step 4b — Geo/Spamhaus IP Reputation blocking (optional)
 
 Blocks entire countries (RU/BY/CN/KP/IR by default) and the
 [Spamhaus DROP](https://www.spamhaus.org/drop/drop.txt) list of hijacked/
 spam-hosting networks — tens of thousands of CIDR ranges, too many to push
 into MikroTik's address-lists directly without eating router memory.
-Instead they're loaded as Suricata **datasets** (a fast lookup structure
-built for exactly this), and only actual **hits** get pushed to MikroTik —
-the same offload pattern the alert bridge already uses for ET signatures.
-See `docs/adr/0001-suricata-dataset-offload-for-geo-spamhaus-blocking.md`
-and `docs/adr/0002-geo-spamhaus-parallel-pipeline.md` for the reasoning.
+Instead they're loaded into Suricata's **IP Reputation (iprep)** engine (a
+CIDR-aware lookup structure built for exactly this — Suricata `dataset`
+cannot hold CIDR entries, it's exact-match only, see
+`docs/adr/0003-ip-reputation-not-datasets-for-geo-spamhaus-cidr-matching.md`),
+and only actual **hits** get pushed to MikroTik — the same offload pattern
+the alert bridge already uses for ET signatures. See also
+`docs/adr/0002-geo-spamhaus-parallel-pipeline.md`.
 
-**1. Create the dataset directory and rule file:**
+> ⚠️ **If you already added `geo_ru`/`geo_by`/... entries under `datasets:`
+> in `suricata.yaml`** (an earlier version of this doc got this wrong):
+> remove those 6 lines. Suricata datasets reject CIDR notation outright —
+> `suricata -T` will fail with `dataset data parse failed ...: <cidr>`.
+> The `defaults:`/`rules:` sub-sections already in your `datasets:` block
+> are unrelated and should stay.
+
+**1. Create the directories and rule file:**
 
 ```bash
-sudo mkdir -p /var/lib/suricata/datasets
+sudo mkdir -p /var/lib/suricata/datasets /etc/suricata/iprep
 sudo curl -o /etc/suricata/rules/geo-spamhaus.rules \
   https://raw.githubusercontent.com/litle-dragon/suricata/main/geo-spamhaus.rules
 ```
 
-**2. Add the country/Spamhaus datasets to the existing `datasets:` block**
-(default `suricata.yaml` already ships one, with `defaults:`/`rules:` —
-add these as sibling keys at the same indent, don't create a second
-`datasets:` key or YAML will silently drop the first one). One entry per
-country plus Spamhaus; edit the country list to match `[geo_spamhaus]
-countries` in `alert-bridge.cfg`:
+**2. Enable IP Reputation in `suricata.yaml`** — these are top-level keys,
+siblings of `datasets:`/`vars:`/`rule-files:`, not nested inside any of
+them (they're commented out by default in stock `suricata.yaml`, search for
+`# IP Reputation`):
 
 ```yaml
-datasets:
-  # ... your existing defaults: / rules: sections stay here unchanged ...
-
-  geo_ru: {type: ip, load: /var/lib/suricata/datasets/geo_ru.lst}
-  geo_by: {type: ip, load: /var/lib/suricata/datasets/geo_by.lst}
-  geo_cn: {type: ip, load: /var/lib/suricata/datasets/geo_cn.lst}
-  geo_kp: {type: ip, load: /var/lib/suricata/datasets/geo_kp.lst}
-  geo_ir: {type: ip, load: /var/lib/suricata/datasets/geo_ir.lst}
-  spamhaus: {type: ip, load: /var/lib/suricata/datasets/spamhaus.lst}
+reputation-categories-file: /etc/suricata/iprep/categories.txt
+default-reputation-path: /etc/suricata/iprep
+reputation-files:
+  - geo-spamhaus-reputation.list
 ```
 
 And add the new rule file to `rule-files:` alongside the ET ruleset:
@@ -290,18 +292,32 @@ rule-files:
 
 **3. Install and schedule `update_geo_lists.py`** — fetches
 [iwik.org](https://www.iwik.org/ipcountry/geoip.txt) (filtered to the
-configured countries) and the Spamhaus DROP list, writes the `.lst` files
-above atomically, and triggers a live `suricatasc -c reload-rules` (no
-Suricata restart). On a fetch failure for either source it leaves
-yesterday's file untouched and sends a Telegram warning instead of blanking
-the list:
+configured countries) and the Spamhaus DROP list, then writes **two kinds
+of file**:
+
+- `local_lists_dir` (default `/var/lib/suricata/datasets`) — plain
+  `geo_<cc>.lst` / `spamhaus.lst`, one CIDR per line. Suricata does **not**
+  read these; they're alert-bridge.py's own private copy for its local
+  "covering range" lookup (`geo_lists.py`) — `iprep`, like the dataset
+  approach it replaced, tells the demon *that* an IP matched a category,
+  never *which* CIDR.
+- `iprep_dir` (default `/etc/suricata/iprep`) — `categories.txt` (one row
+  per country + Spamhaus) and `geo-spamhaus-reputation.list` (every CIDR
+  above, tagged with its category), the files Suricata actually loads.
+
+On a fetch failure for either source it leaves yesterday's `.lst` file
+untouched, rebuilds `geo-spamhaus-reputation.list` from whatever is
+currently on disk (so a partial outage never blanks the list), and sends a
+Telegram warning. It then triggers a live `suricatasc -c reload-rules` —
+covers both the rule reload and the IP Reputation data reload, no Suricata
+restart:
 
 ```bash
 sudo curl -o /opt/alert-bridge/update_geo_lists.py \
   https://raw.githubusercontent.com/litle-dragon/suricata/main/update_geo_lists.py
 sudo curl -o /opt/alert-bridge/geo_lists.py \
   https://raw.githubusercontent.com/litle-dragon/suricata/main/geo_lists.py
-sudo python3 /opt/alert-bridge/update_geo_lists.py   # first run — populates the .lst files
+sudo python3 /opt/alert-bridge/update_geo_lists.py   # first run — populates every file above
 ```
 
 ```bash
@@ -310,10 +326,13 @@ sudo chmod +x /etc/cron.daily/update-geo-lists
 ```
 
 **4. Add the `[geo_spamhaus]` section** to `/opt/alert-bridge/alert-bridge.cfg`
-(see `alert-bridge.cfg.example` for every key + default) and restart the
-bridge so `geo_lists.py`/`classify_category()` pick up the new config:
+(see `alert-bridge.cfg.example` for every key + default), validate, then
+restart both services — `categories.txt` is only read at Suricata startup
+(unlike the reputation list, it does **not** hot-reload):
 
 ```bash
+sudo suricata -T -c /etc/suricata/suricata.yaml
+sudo systemctl restart suricata
 sudo systemctl restart alert-bridge
 ```
 

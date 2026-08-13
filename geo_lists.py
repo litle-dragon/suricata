@@ -2,13 +2,16 @@
 """Local "covering range" lookup for the geo/Spamhaus block-lists — imported by
 alert-bridge.py, not run standalone in production.
 
-Suricata's `dataset:isset` is a binary membership check: an alert tells us the
-attacker IP matched *some* entry in e.g. `geo_ru.lst`, but not which CIDR (see
-docs/adr/0001-suricata-dataset-offload-for-geo-spamhaus-blocking.md). This
-module reads the same flat `.lst` files Suricata loads as datasets (one CIDR
-per line, IPv4-only per CONTEXT.md "Діапазон") and does its own O(log n)
-bisect lookup to find the exact covering CIDR before the demon blocks it on
-MikroTik.
+Suricata's IP Reputation (iprep) is a category+score check: an alert tells us
+the attacker IP matched *some* entry in a category (e.g. GEO-RU), but not
+which CIDR (see docs/adr/0003-ip-reputation-not-datasets-for-geo-spamhaus-cidr-matching.md,
+which supersedes ADR-0001's original dataset-based design — Suricata
+`dataset type: ip` turned out to be exact-match only, rejecting CIDR entries).
+This module reads the same flat `.lst` files update_geo_lists.py writes (one
+CIDR per line, IPv4-only per CONTEXT.md "Діапазон") — Suricata itself no
+longer reads these directly, they're this module's own private copy — and
+does its own O(log n) bisect lookup to find the exact covering CIDR before
+the demon blocks it on MikroTik.
 
 Files are re-parsed only when their mtime changes (update_geo_lists.py
 replaces them atomically once a day) — not on every alert.
@@ -34,7 +37,7 @@ COUNTRIES = [
     for cc in _cfg.get("geo_spamhaus", "countries", fallback="RU,BY,CN,KP,IR").split(",")
     if cc.strip()
 ]
-DATASET_DIR = _cfg.get("geo_spamhaus", "dataset_dir", fallback="/var/lib/suricata/datasets")
+LOCAL_LISTS_DIR = _cfg.get("geo_spamhaus", "local_lists_dir", fallback="/var/lib/suricata/datasets")
 MIKROTIK_GEO_LIST = _cfg.get("geo_spamhaus", "mikrotik_geo_list", fallback="suricata-geo-block")
 MIKROTIK_SPAMHAUS_LIST = _cfg.get("geo_spamhaus", "mikrotik_spamhaus_list", fallback="suricata-spamhaus-block")
 
@@ -43,7 +46,7 @@ _cache: dict[str, tuple[float, list[tuple[int, int, str]]]] = {}
 
 
 def list_path(list_name: str) -> str:
-    return os.path.join(DATASET_DIR, f"{list_name}.lst")
+    return os.path.join(LOCAL_LISTS_DIR, f"{list_name}.lst")
 
 
 def _parse_lst(path: str) -> list[tuple[int, int, str]]:
@@ -82,10 +85,10 @@ def _load_ranges(list_name: str) -> list[tuple[int, int, str]]:
 
 
 def covering_range(list_name: str, ip: str) -> str | None:
-    """Returns the exact CIDR from `<DATASET_DIR>/<list_name>.lst` that covers
+    """Returns the exact CIDR from `<LOCAL_LISTS_DIR>/<list_name>.lst` that covers
     `ip`, or None if the list is missing/empty or genuinely doesn't cover it
-    (local copy drifted from what Suricata matched against — caller falls
-    back to blocking the bare IP)."""
+    (local copy drifted from what Suricata's IP Reputation data matched
+    against — caller falls back to blocking the bare IP)."""
     try:
         ip_obj = ipaddress.ip_address(ip)
     except ValueError:
@@ -109,8 +112,8 @@ def _self_test() -> bool:
 
     ok = True
     with tempfile.TemporaryDirectory() as tmp:
-        global DATASET_DIR
-        DATASET_DIR = tmp
+        global LOCAL_LISTS_DIR
+        LOCAL_LISTS_DIR = tmp
         _cache.clear()
         with open(list_path("geo_test"), "w") as f:
             f.write("# comment line, must be skipped\n")
@@ -156,7 +159,7 @@ def _self_test() -> bool:
 
 
 if __name__ == "__main__":
-    print(f"geo_lists self-test — COUNTRIES={COUNTRIES}, DATASET_DIR={DATASET_DIR}")
+    print(f"geo_lists self-test — COUNTRIES={COUNTRIES}, LOCAL_LISTS_DIR={LOCAL_LISTS_DIR}")
     passed = _self_test()
     print("SELF-TEST PASSED" if passed else "SELF-TEST FAILED")
     raise SystemExit(0 if passed else 1)
