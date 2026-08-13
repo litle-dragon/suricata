@@ -262,11 +262,16 @@ the alert bridge already uses for ET signatures. See also
 > The `defaults:`/`rules:` sub-sections already in your `datasets:` block
 > are unrelated and should stay.
 
-**1. Create the directories and rule file:**
+**1. Create the directories and rule file** — the rule file goes wherever
+your `default-rule-path` in `suricata.yaml` points (typically
+`/var/lib/suricata/rules`, where `suricata-update` already installed
+`suricata.rules`; check yours with `grep default-rule-path
+/etc/suricata/suricata.yaml` if unsure — `rule-files:` entries resolve
+relative to it):
 
 ```bash
 sudo mkdir -p /var/lib/suricata/datasets /etc/suricata/iprep
-sudo curl -o /etc/suricata/rules/geo-spamhaus.rules \
+sudo curl -o /var/lib/suricata/rules/geo-spamhaus.rules \
   https://raw.githubusercontent.com/litle-dragon/suricata/main/geo-spamhaus.rules
 ```
 
