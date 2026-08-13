@@ -261,12 +261,17 @@ sudo curl -o /etc/suricata/rules/geo-spamhaus.rules \
   https://raw.githubusercontent.com/litle-dragon/suricata/main/geo-spamhaus.rules
 ```
 
-**2. Register the datasets in `suricata.yaml`** — add a `datasets:` block
-(one entry per country plus Spamhaus; edit the country list to match
-`[geo_spamhaus] countries` in `alert-bridge.cfg`):
+**2. Add the country/Spamhaus datasets to the existing `datasets:` block**
+(default `suricata.yaml` already ships one, with `defaults:`/`rules:` —
+add these as sibling keys at the same indent, don't create a second
+`datasets:` key or YAML will silently drop the first one). One entry per
+country plus Spamhaus; edit the country list to match `[geo_spamhaus]
+countries` in `alert-bridge.cfg`:
 
 ```yaml
 datasets:
+  # ... your existing defaults: / rules: sections stay here unchanged ...
+
   geo_ru: {type: ip, load: /var/lib/suricata/datasets/geo_ru.lst}
   geo_by: {type: ip, load: /var/lib/suricata/datasets/geo_by.lst}
   geo_cn: {type: ip, load: /var/lib/suricata/datasets/geo_cn.lst}
