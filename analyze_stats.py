@@ -57,7 +57,7 @@ import sqlite3
 import sys
 import syslog
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 try:
     import requests
@@ -970,7 +970,7 @@ def _local_to_utc_str(local_str: str) -> str:
             continue
     else:
         raise ValueError(f"unrecognized date/time: {local_str!r} (use 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM')")
-    offset = datetime.now() - datetime.utcnow()  # local wall-clock minus UTC, ~current DST-aware offset
+    offset = datetime.now() - datetime.now(timezone.utc).replace(tzinfo=None)  # local minus UTC wall-clock
     return (local_dt - offset).strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -988,7 +988,7 @@ def _messages_window(hours: int | None, days: int | None, date: str | None,
     if days is not None:
         day_from = (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
     if hours is not None:
-        ts_from = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+        ts_from = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     if dt_from:
         ts_from = _local_to_utc_str(dt_from)
     if dt_to:
