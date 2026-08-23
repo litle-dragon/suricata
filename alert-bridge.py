@@ -49,6 +49,13 @@ from the last 3 days and resends it before following new alerts.
 Message search: analyze_stats.py --messages reconstructs and prints archived reports
 (slot/daily/spike from their structured columns, service_events verbatim), filterable
 by --kind/--hours/--days/--date/--from/--to.
+
+Restart-safe period state: slot/daily hit-volume counters (_slot_alerts_count,
+per-subnet/addr aggregation for both ТОП10s, geo/spamhaus per-country hit counts)
+are in-memory only during normal operation but persisted per-hit to hit_log
+(UPSERT, same pattern as seen_ips/subnet_daily_ips); restore_period_state() rebuilds
+them at every startup from hit_log + seen_ips/seen_subnets.first_seen + permanent_blocks,
+so a restart mid-slot/mid-day no longer silently drops that period's partial progress.
 """
 
 import configparser
@@ -60,6 +67,7 @@ import sqlite3
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 
 import requests
 import urllib3
@@ -282,6 +290,23 @@ CREATE TABLE IF NOT EXISTS service_events (
 );
 CREATE INDEX IF NOT EXISTS idx_service_events_ts ON service_events(ts);
 CREATE INDEX IF NOT EXISTS idx_service_events_kind ON service_events(kind);
+-- Restart-safe raw hit-volume tracking (not just blocks) for both the
+-- regular inbound pipeline (pipeline='inbound', bucket=/24 subnet) and
+-- geo/spamhaus (pipeline='geo-<cc>'/'spamhaus', bucket=covering_range/IP).
+-- UPSERTed on every alert (mirrors the seen_ips/subnet_daily_ips pattern);
+-- restore_period_state() rebuilds in-memory slot/daily aggregation from
+-- this at startup. Pruned per-day at midnight rollover, not per-slot --
+-- see _reset_daily_state.
+CREATE TABLE IF NOT EXISTS hit_log (
+    day TEXT NOT NULL,
+    slot_index INTEGER NOT NULL,
+    pipeline TEXT NOT NULL,
+    bucket TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    alerts INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, slot_index, pipeline, bucket, ip)
+);
+CREATE INDEX IF NOT EXISTS idx_hit_log_day ON hit_log(day);
 """
 
 # Columns added after initial release — applied via ALTER TABLE on databases
@@ -515,6 +540,38 @@ def get_subnet(ip: str) -> str:
         return ip
 
 
+def record_hit_log(pipeline: str, bucket: str, ip: str) -> None:
+    """UPSERT one alert into hit_log against the current (day, slot) bucket --
+    the restart-safe raw-volume record restore_period_state() rebuilds
+    in-memory slot/daily aggregation from at startup."""
+    _conn.execute(
+        "INSERT INTO hit_log(day, slot_index, pipeline, bucket, ip, alerts) VALUES(?,?,?,?,?,1) "
+        "ON CONFLICT(day, slot_index, pipeline, bucket, ip) DO UPDATE SET alerts = alerts + 1",
+        (_digest_day, _slot_index, pipeline, bucket, ip),
+    )
+
+
+def _period_utc_bounds(day: str, slot_index: int | None) -> tuple[str, str]:
+    """Local-day (optionally local-slot) start/end converted to UTC
+    'YYYY-MM-DD HH:MM:SS' strings, for comparing against SQLite's
+    CURRENT_TIMESTAMP columns (always UTC regardless of server timezone --
+    verified this box runs Europe/Kyiv, UTC+3, same issue analyze_stats.py's
+    _local_to_utc_str fixes). slot_index=None means the whole day."""
+    if slot_index is None:
+        start_h, end_h = 0, 23
+    else:
+        start_h = slot_index * 6
+        end_h = start_h + 5
+    local_start = datetime.strptime(f"{day} {start_h:02d}:00:00", "%Y-%m-%d %H:%M:%S")
+    local_end = datetime.strptime(f"{day} {end_h:02d}:59:59", "%Y-%m-%d %H:%M:%S")
+    offset = datetime.now() - datetime.now(timezone.utc).replace(tzinfo=None)
+    return (
+        (local_start - offset).strftime("%Y-%m-%d %H:%M:%S"),
+        (local_end - offset).strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+
 def record_hit(direction: str, ip: str, sig: str) -> tuple[int, str, int, bool]:
     """
     Records an inbound/outbound hit against slot + daily counters and updates
@@ -552,6 +609,7 @@ def record_hit(direction: str, ip: str, sig: str) -> tuple[int, str, int, bool]:
     s_slot = _slot_inbound_subnets.setdefault(subnet_str, {"ips": set(), "alerts": 0})
     s_slot["ips"].add(ip)
     s_slot["alerts"] += 1
+    record_hit_log("inbound", subnet_str, ip)
 
     # Daily counters (drive digest reporting + midnight snapshot; block thresholds
     # now read _all_time_subnet_ips instead, see main())
@@ -1424,6 +1482,121 @@ def _reset_daily_state(new_day: str) -> None:
     # drop the completed day's rows in-memory and on disk now that it's over.
     _subnet_daily_ips.clear()
     _conn.execute("DELETE FROM subnet_daily_ips WHERE day=?", (old_day,))
+    _conn.execute("DELETE FROM hit_log WHERE day=?", (old_day,))
+
+
+def restore_period_state() -> None:
+    """Rebuilds in-memory slot/daily hit-volume state from hit_log +
+    seen_ips/seen_subnets.first_seen + permanent_blocks.blocked_at, after a
+    restart. Runs once at startup (main(), right after db_init()), before
+    following new alerts -- so a deploy/crash mid-slot or mid-day no longer
+    silently drops that period's partial contribution to the next digest/
+    report. See module docstring "Restart-safe period state"."""
+    global _slot_alerts_count, _slot_spamhaus_count, _daily_spamhaus_count
+    global _slot_perm_ips_count, _slot_perm_subnets_count
+    global _daily_permanent_ips_count, _daily_permanent_subnets_count
+    global _slot_spamhaus_new_count, _daily_spamhaus_new_count
+
+    day = _digest_day
+    slot = _slot_index
+    slot_start, slot_end = _period_utc_bounds(day, slot)
+    day_start, day_end = _period_utc_bounds(day, None)
+
+    # --- hit volume: regular inbound pipeline ---
+    for bucket, ip, alerts in _conn.execute(
+        "SELECT bucket, ip, alerts FROM hit_log WHERE day=? AND slot_index=? AND pipeline='inbound'",
+        (day, slot),
+    ):
+        _slot_alerts_count += alerts
+        _slot_inbound_counts[ip] = _slot_inbound_counts.get(ip, 0) + alerts
+        s = _slot_inbound_subnets.setdefault(bucket, {"ips": set(), "alerts": 0})
+        s["ips"].add(ip)
+        s["alerts"] += alerts
+    for bucket, ip, alerts in _conn.execute(
+        "SELECT bucket, ip, SUM(alerts) FROM hit_log WHERE day=? AND pipeline='inbound' GROUP BY bucket, ip",
+        (day,),
+    ):
+        _daily_inbound_counts[ip] = _daily_inbound_counts.get(ip, 0) + alerts
+        s = _daily_inbound_subnets.setdefault(bucket, {"ips": set(), "alerts": 0})
+        s["ips"].add(ip)
+        s["alerts"] += alerts
+
+    # --- hit volume: geo/spamhaus pipeline ---
+    for pipeline, bucket, ip, alerts in _conn.execute(
+        "SELECT pipeline, bucket, ip, alerts FROM hit_log WHERE day=? AND slot_index=? AND pipeline!='inbound'",
+        (day, slot),
+    ):
+        label = pipeline[len("geo-"):].upper() if pipeline.startswith("geo-") else "Spamhaus"
+        s = _slot_geo_spamhaus_subnets.setdefault(bucket, {"ips": set(), "alerts": 0, "label": label})
+        s["ips"].add(ip)
+        s["alerts"] += alerts
+        if pipeline.startswith("geo-"):
+            cc = pipeline[len("geo-"):]
+            _slot_geo_counts[cc] = _slot_geo_counts.get(cc, 0) + alerts
+        else:
+            _slot_spamhaus_count += alerts
+    for pipeline, bucket, ip, alerts in _conn.execute(
+        "SELECT pipeline, bucket, ip, SUM(alerts) FROM hit_log WHERE day=? AND pipeline!='inbound' "
+        "GROUP BY pipeline, bucket, ip",
+        (day,),
+    ):
+        label = pipeline[len("geo-"):].upper() if pipeline.startswith("geo-") else "Spamhaus"
+        s = _daily_geo_spamhaus_subnets.setdefault(bucket, {"ips": set(), "alerts": 0, "label": label})
+        s["ips"].add(ip)
+        s["alerts"] += alerts
+        if pipeline.startswith("geo-"):
+            cc = pipeline[len("geo-"):]
+            _daily_geo_counts[cc] = _daily_geo_counts.get(cc, 0) + alerts
+        else:
+            _daily_spamhaus_count += alerts
+
+    # --- new-IP/new-subnet: seen_ips/seen_subnets already own "first ever seen" ---
+    for (ip,) in _conn.execute("SELECT ip FROM seen_ips WHERE first_seen BETWEEN ? AND ?", (slot_start, slot_end)):
+        _slot_new_ips.add(ip)
+    for (ip,) in _conn.execute("SELECT ip FROM seen_ips WHERE first_seen BETWEEN ? AND ?", (day_start, day_end)):
+        _daily_new_ips.add(ip)
+    for (subnet,) in _conn.execute("SELECT subnet FROM seen_subnets WHERE first_seen BETWEEN ? AND ?", (slot_start, slot_end)):
+        _slot_new_subnets.add(subnet)
+    for (subnet,) in _conn.execute("SELECT subnet FROM seen_subnets WHERE first_seen BETWEEN ? AND ?", (day_start, day_end)):
+        _daily_new_subnets.add(subnet)
+
+    # --- permanent blocks: permanent_blocks already owns "blocked at" ---
+    for addr, kind in _conn.execute(
+        "SELECT ip_or_subnet, kind FROM permanent_blocks WHERE blocked_at BETWEEN ? AND ?", (day_start, day_end)
+    ):
+        if kind == "ip":
+            _daily_permanent_ips_count += 1
+            _daily_permanent_ips_list.add(addr)
+        elif kind == "subnet":
+            _daily_permanent_subnets_count += 1
+            _daily_permanent_subnets_list.add(addr)
+        elif kind.startswith("geo-"):
+            cc = kind[len("geo-"):]
+            _daily_geo_new_counts[cc] = _daily_geo_new_counts.get(cc, 0) + 1
+            _daily_geo_new_list.append(f"{cc.upper()} {addr}")
+        elif kind == "spamhaus":
+            _daily_spamhaus_new_count += 1
+            _daily_spamhaus_new_list.append(addr)
+    for addr, kind in _conn.execute(
+        "SELECT ip_or_subnet, kind FROM permanent_blocks WHERE blocked_at BETWEEN ? AND ?", (slot_start, slot_end)
+    ):
+        if kind == "ip":
+            _slot_perm_ips_count += 1
+            _slot_perm_ips_list.add(addr)
+        elif kind == "subnet":
+            _slot_perm_subnets_count += 1
+            _slot_perm_subnets_list.add(addr)
+        elif kind.startswith("geo-"):
+            cc = kind[len("geo-"):]
+            _slot_geo_new_counts[cc] = _slot_geo_new_counts.get(cc, 0) + 1
+            _slot_geo_new_list.append(f"{cc.upper()} {addr}")
+        elif kind == "spamhaus":
+            _slot_spamhaus_new_count += 1
+            _slot_spamhaus_new_list.append(addr)
+
+    print(f"restore-period-state day={day} slot={slot} slot_alerts={_slot_alerts_count} "
+          f"daily_alerts={sum(_daily_inbound_counts.values())} slot_geo_spamhaus_hits={_slot_spamhaus_count + sum(_slot_geo_counts.values())}",
+          flush=True)
 
 
 def check_spike(now: float) -> None:
@@ -1574,6 +1747,7 @@ def main() -> None:
     global _slot_perm_ips_count, _slot_perm_subnets_count, _slot_spamhaus_count, _daily_spamhaus_count
     global _slot_spamhaus_new_count, _daily_spamhaus_new_count
     db_init()
+    restore_period_state()
     # Startup guard: if we boot after 07:00, don't re-fire yesterday's report on every restart.
     if int(time.strftime("%H")) >= 7:
         _last_7am_report_date = time.strftime("%Y-%m-%d")
@@ -1642,6 +1816,7 @@ def main() -> None:
                 s_daily_gs = _daily_geo_spamhaus_subnets.setdefault(addr, {"ips": set(), "alerts": 0, "label": label})
                 s_daily_gs["ips"].add(target_ip)
                 s_daily_gs["alerts"] += 1
+                record_hit_log(f"geo-{cc}" if kind == "geo" else "spamhaus", addr, target_ip)
                 if kind == "geo":
                     _slot_geo_counts[cc] = _slot_geo_counts.get(cc, 0) + 1
                     _daily_geo_counts[cc] = _daily_geo_counts.get(cc, 0) + 1
