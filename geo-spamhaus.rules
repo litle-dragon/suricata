@@ -1,6 +1,6 @@
 # Geo (RU/BY/CN/KP/IR) + Spamhaus DROP blocking via Suricata IP Reputation (iprep).
-# See README.md Step 4b and docs/adr/0003-ip-reputation-not-datasets-for-geo-spamhaus-cidr-matching.md
-# (supersedes docs/adr/0001-...: Suricata `dataset type: ip` is exact-match only and
+# See README.md Step 4b and PROJECT_HISTORY.md (ADR-0003)
+# (supersedes ADR-0001: Suricata `dataset type: ip` is exact-match only and
 # rejects CIDR entries -- confirmed on a live 7.0.3 box. iprep is the CIDR-aware
 # mechanism: its reputation-file format natively accepts CIDR notation).
 #

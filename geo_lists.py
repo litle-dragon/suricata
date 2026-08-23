@@ -4,7 +4,7 @@ alert-bridge.py, not run standalone in production.
 
 Suricata's IP Reputation (iprep) is a category+score check: an alert tells us
 the attacker IP matched *some* entry in a category (e.g. GEO-RU), but not
-which CIDR (see docs/adr/0003-ip-reputation-not-datasets-for-geo-spamhaus-cidr-matching.md,
+which CIDR (see PROJECT_HISTORY.md, ADR-0003,
 which supersedes ADR-0001's original dataset-based design — Suricata
 `dataset type: ip` turned out to be exact-match only, rejecting CIDR entries).
 This module reads the same flat `.lst` files update_geo_lists.py writes (one

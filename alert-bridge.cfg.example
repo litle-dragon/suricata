@@ -87,8 +87,8 @@ resend_lookback_days = 3
 new_addr_list_threshold = 10
 
 [geo_spamhaus]
-# Master switch for geo/Spamhaus IP-reputation blocking (docs/adr/0002,
-# docs/adr/0003). When false, alert-bridge.py never reads this section
+# Master switch for geo/Spamhaus IP-reputation blocking (PROJECT_HISTORY.md,
+# ADR-0002/ADR-0003). When false, alert-bridge.py never reads this section
 # further -- classify_category() still parses signatures, but the block is
 # meaningless if update_geo_lists.py was never set up. (default: true)
 enabled = true

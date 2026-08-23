@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fetch iwik.org GeoIP country ranges and the Spamhaus DROP list, write them
 as Suricata IP Reputation (iprep) source files, and trigger a live reload --
-no Suricata restart (docs/adr/0003-ip-reputation-not-datasets-for-geo-spamhaus-cidr-matching.md).
+no Suricata restart (PROJECT_HISTORY.md, ADR-0003).
 
 Suricata `dataset type: ip` is exact-match only and rejects CIDR entries
 (confirmed on a live 7.0.3 box -- see ADR-0003, which supersedes ADR-0001's
@@ -18,7 +18,7 @@ by Suricata anymore; they're alert-bridge.py's own private copy for its local
 approach before it -- only tells the demon THAT an IP matched a category, not
 WHICH CIDR.
 
-Same style as parse_rules_ips.py / sync_rules_to_mikrotik.py: argparse,
+Same style as the rest of the repo's helper scripts: argparse,
 syslog logging via _jlog, config read from alert-bridge.cfg, atomic write
 (tmp file + os.replace).
 

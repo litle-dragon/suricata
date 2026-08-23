@@ -280,7 +280,7 @@ def cmd_day(conn: sqlite3.Connection, day: str, show_list: bool = False, out_fh=
 
 def cmd_geo(conn: sqlite3.Connection):
     """Breakdown of permanent geo/Spamhaus blocks, grouped by kind -- separate
-    from --sum/--top (docs/adr/0002: geo/Spamhaus is its own parallel
+    from --sum/--top (PROJECT_HISTORY.md ADR-0002: geo/Spamhaus is its own parallel
     pipeline, never touches the ordinary 'ip'/'subnet' permanent_blocks rows
     or seen_ips/seen_subnets uniqueness)."""
     rows = list(conn.execute(

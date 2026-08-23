@@ -699,7 +699,7 @@ _SPAMHAUS_PREFIX = "SPAMHAUS-BLOCK-"  # SPAMHAUS-BLOCK-IN / SPAMHAUS-BLOCK-OUT
 
 def classify_category(sig: str) -> tuple[str, str | None] | None:
     """Parses a Suricata alert signature against the geo/Spamhaus rule-naming
-    convention (geo-spamhaus.rules, docs/adr/0001-...) and returns the block
+    convention (geo-spamhaus.rules, PROJECT_HISTORY.md ADR-0001) and returns the block
     category, or None for every ordinary ET signature (unchanged path).
     Returns ("geo", "<cc-lower>") or ("spamhaus", None)."""
     if sig.startswith(_GEO_PREFIX):

@@ -481,119 +481,29 @@ ADD COLUMN`, застосовується ідемпотентно при кож
 
 ---
 
-## 3. `migrate_json_to_sqlite.py` — одноразова міграція легасі-стану
+## 3. Загальна архітектура даних (як усе пов'язано)
 
-До переходу на SQLite бридж зберігав стан у двох JSON-файлах
-(`alert-bridge-total-state.json` — накопичувальний, `alert-bridge-state.json`
-— поточний день). Скрипт:
-1. Читає обидва файли (`inbound_counts: {ip: count}`), мерджить через `max()`
-   на IP (кумулятивний файл домінує, денний доповнює пропуски).
-2. З кожного IP виводить підмережу (`get_subnet`, та сама логіка /24-/64) і
-   сумує хіти по підмережах.
-3. `INSERT OR IGNORE` в `seen_ips`/`seen_subnets` — ідемпотентно, ніколи не
-   перезаписує існуючі рядки, безпечно запускати повторно чи на живій базі.
-Мета: щоб перший день після переходу не показав усіх вже відомих атакуючих
-як "нових". Only inbound — точно дзеркалить, що рахує сам бридж для
-all-time унікальності. Ключові дії логуються через syslog (`_jlog`), як і
-решта write-скриптів репозиторію.
-
----
-
-## 4. `parse_rules_ips.py` — витяг репутаційних IP/підмереж з правил Suricata
-
-Не пов'язаний напряму з alert-bridge (окрема утиліта для формування списку
-блокування на MikroTik з вмісту самих сигнатур).
-
-### Алгоритм
-1. Regex `^\s*alert\s+\w+\s+\[([^\]]+)\]` — знаходить рядки правил виду
-   `alert <proto> [ip1,ip2,...] ...` і витягує вміст квадратних дужок.
-2. Другий regex витягує з цього вмісту токени, схожі на IP/CIDR (IPv4/IPv6 з
-   опційним `/prefix`), знімає провідний `!` (заперечення в Suricata-синтаксі).
-3. `aggregate_ips_to_24(items, min_ips_per_24=2)`:
-   - готові підмережі (prefix < 32/128) лишаються як є;
-   - окремі IP групуються за батьківським /24 (або /64 для IPv6);
-   - якщо в /24 потрапило ≥ `min_ips_per_24` адрес — уся /24 йде в результат
-     замість окремих IP (стиснення списку);
-   - інакше окремі IP лишаються окремими записами;
-   - фінальний прохід прибирає одиночні IP, які вже покриті якоюсь підмережею
-     з результату (уникнення дублікатів).
-Результат — сортований список підмереж/IP, або в stdout, або у файл
-(`--output`), який потім споживає `sync_rules_to_mikrotik.py`. Обидва шляхи
-виводу (файл і stdout) логуються через syslog (`_jlog`) з кількістю
-збережених підмереж/IP.
-
----
-
-## 5. `sync-state-from-journal.py` — легасі-відновлення JSON-стану з journalctl
-
-Позначено в README як "unused since SQLite migration" — залишений код,
-описує, як раніше відновлювався стан після втрати `alert-bridge-state.json`.
-
-### Алгоритм
-1. `journalctl -u alert-bridge --since today` — витягує лог-рядки поточного
-   сервісу за сьогодні.
-2. Двома regex парсить `attacker=<ip>` (inbound) і `target=<ip>` (outbound) з
-   рядків формату, який писав старий `alert-bridge.py` у stdout/journal.
-3. Фільтрує IP через `is_home_or_lan` (той самий набір RFC1918/CGNAT/DNS-
-   резолверів, продубльований локально в цьому файлі, а не імпортований).
-4. Мерджить лічильники з існуючим `alert-bridge-state.json` (якщо дата
-   збігається) через `max()`, інакше починає новий стан на сьогодні.
-5. Атомарний запис: пише у `.tmp`, потім `os.replace()` — уникнення
-   пошкодження файлу при обриві процесу.
-
----
-
-## 6. `sync_rules_to_mikrotik.py` — масове завантаження списку блоку на MikroTik
-
-Приймає файл, вироблений `parse_rules_ips.py` (`malicious_subnets.txt`), і
-заливає його на роутер одним REST-викликом через `/rest/execute` (виконання
-RouterOS-скрипту), а не через окремі POST/PUT на кожен запис.
-
-### Алгоритм
-1. `load_malicious_items` — читає файл, унікалізує, сортує.
-2. `deduplicate_subnets_and_ips` — прибирає окремі /32 (/128) IP, які вже
-   покриті якоюсь підмережею зі списку (та сама ідея, що й у
-   `parse_rules_ips.py`, але без агрегації — тільки дедуплікація готового
-   набору).
-3. `sync_via_rest_execute`:
-   - ділить список на чанки по `chunk_size` (дефолт 400) — обхід лімітів на
-     розмір payload/довжину RouterOS-скрипту;
-   - перший чанк починається з `/ip firewall address-list remove [find
-     list=<name>]` — повне очищення старого списку перед заливкою нового;
-   - кожен елемент чанку — рядок `add list=<name> address=<net>
-     comment="ET Rule Subnet"`;
-   - весь чанк відправляється одним `POST /rest/execute` з тілом
-     `{"script": "<текст RouterOS-скрипту>"}` — це вибір "Option A: пряме
-     виконання без запису файлів на диск роутера" (уникнення проблем з
-     правами на файлову систему MikroTik).
-Немає інтеграції з `seen_ips`/`seen_subnets` SQLite — джерело даних тут
-виключно текстовий файл від `parse_rules_ips.py`, тобто цей ланцюжок
-незалежний від живого бриджа й БД. Початок і завершення синхронізації
-логуються через syslog (`_jlog`), включно з кількістю чанків і підсумковим
-success/total.
-
----
-
-## Загальна архітектура даних (як усе пов'язано)
+> Допоміжні одноразові/легасі скрипти (`migrate_json_to_sqlite.py`,
+> `sync-state-from-journal.py`, `parse_rules_ips.py`,
+> `sync_rules_to_mikrotik.py`) видалено з репозиторію 2026-08-23 —
+> нерелевантні, не задіяні в жодному кроці README, міграція на SQLite вже
+> давно завершена в проді. Історія — `git log`, `PROJECT_HISTORY.md`.
 
 ```
 eve.json (Suricata) → alert-bridge.py (демон) → SQLite alert_bridge.db
                                               → MikroTik REST (live-блок)
                                               → Telegram (спайк/6h/07:00/
                                                  старт-стоп/reconcile-звіт/
-                                                 resend недоставленого)
+                                                 on-demand/resend недоставленого)
 
 alert_bridge.db → analyze_stats.py (звіти, --top з Blocked-колонкою,
                                      --sync-mikrotik: all-time поріг,
                                      --merge-adjacent: агрегація живого списку,
-                                     --verify-blocks[--fix]: аудит vs реальність)
+                                     --verify-blocks[--fix]: аудит vs реальність,
+                                     --messages: пошук/показ надісланого)
 
-suricata.rules → parse_rules_ips.py → malicious_subnets.txt
-                                    → sync_rules_to_mikrotik.py → MikroTik REST
-                                       (окремий, batch-шлях, не залежить від БД)
-
-legacy JSON (*.json) → migrate_json_to_sqlite.py → seen_ips/seen_subnets (one-time)
-journalctl logs → sync-state-from-journal.py → legacy JSON (unused, залишок)
+iwik.org/spamhaus.org → update_geo_lists.py (cron.daily) → geo_*.lst +
+                         geo-spamhaus-reputation.list/categories.txt → Suricata IP Reputation
 ```
 
 Три незалежні механізми постійного блокування підмереж, усі на одному

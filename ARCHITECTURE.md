@@ -3,7 +3,7 @@
 > Високорівневий огляд системи: компоненти, потоки даних, схема БД,
 > деплой-топологія. Деталі "що саме робить кожна функція" — `FUNCTIONALITY.md`
 > (по коду). Термінологія — `CONTEXT.md`. Покрокова інструкція розгортання —
-> `README.md`. Історія проєктних рішень — `docs/adr/*.md`, `geo-spamhaus-plan.md`.
+> `README.md`. Історія проєктних рішень — `PROJECT_HISTORY.md`.
 >
 > Останнє оновлення: 2026-08-23 (після сесії: message archive/search,
 > on-demand звіти, GEO/Spamhaus TOP10, restart-safe стан, фікс кешу
@@ -42,11 +42,9 @@ Linux box:                                       │ api.telegram.org (Bot API)
                                  --messages)
 ```
 
-Допоміжний, незалежний ланцюжок (не залежить від БД чи живого демона):
-`parse_rules_ips.py` → `malicious_subnets.txt` → `sync_rules_to_mikrotik.py`
-— масове batch-завантаження репутаційних IP з наявних Suricata-правил.
-`migrate_json_to_sqlite.py` і `sync-state-from-journal.py` — легасі,
-одноразові/незатребувані відтоді, як стан переїхав у SQLite.
+`update_geo_lists.py` (cron.daily) — незалежний фетч-цикл, описаний у §2
+вище, теж не залежить від живого демона напряму (пише файли, тригерить
+Suricata reload, не торкається `alert_bridge.db`).
 
 ## 3. Три конвеєри блокування
 

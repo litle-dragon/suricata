@@ -250,10 +250,10 @@ into MikroTik's address-lists directly without eating router memory.
 Instead they're loaded into Suricata's **IP Reputation (iprep)** engine (a
 CIDR-aware lookup structure built for exactly this — Suricata `dataset`
 cannot hold CIDR entries, it's exact-match only, see
-`docs/adr/0003-ip-reputation-not-datasets-for-geo-spamhaus-cidr-matching.md`),
+`PROJECT_HISTORY.md` (ADR-0003)),
 and only actual **hits** get pushed to MikroTik — the same offload pattern
 the alert bridge already uses for ET signatures. See also
-`docs/adr/0002-geo-spamhaus-parallel-pipeline.md`.
+`PROJECT_HISTORY.md` (ADR-0002).
 
 > ⚠️ **If you already added `geo_ru`/`geo_by`/... entries under `datasets:`
 > in `suricata.yaml`** (an earlier version of this doc got this wrong):
@@ -362,7 +362,7 @@ blocking deliberately doesn't cover IPv6 (see CONTEXT.md "Діапазон"):
 
 From here, a GEO-BLOCK-\*/SPAMHAUS-BLOCK-\* alert is blocked on MikroTik
 immediately and permanently on its first hit — no escalation, no cooldown
-(see `docs/adr/0002-...`). Country/Spamhaus breakdowns show up in the 6-hour
+(see `PROJECT_HISTORY.md`, ADR-0002). Country/Spamhaus breakdowns show up in the 6-hour
 digest, the 07:00 report, and `analyze_stats.py --geo`.
 
 ## Step 5 — Install the rules and verify
@@ -1045,7 +1045,14 @@ sudo tail -f /var/log/suricata/eve.json | jq -c 'select(.event_type=="alert") | 
 | [`alert-bridge.py`](alert-bridge.py) | Tails `eve.json`, blocks attackers via the MikroTik REST API, records to SQLite, and pages Telegram on spikes/digests; `SIGUSR1`/`SIGUSR2` send an on-demand slot/daily snapshot |
 | [`alert-bridge.service`](alert-bridge.service) | systemd unit for the bridge |
 | [`analyze_stats.py`](analyze_stats.py) | Queries the SQLite database — daily summaries, spike log, top attackers, real addresses, subnet cleanup, sent-message search (`--sum` / `--day` / `--spikes` / `--top` / `--list` / `--list-out` / `--sync-mikrotik` / `--merge-adjacent` / `--verify-blocks` / `--fix` / `--messages`) |
-| [`sync-state-from-journal.py`](sync-state-from-journal.py) | Legacy — rebuilt the old JSON state from `journalctl`; unused since the SQLite migration |
-| [`migrate_json_to_sqlite.py`](migrate_json_to_sqlite.py) | One-time — seeds SQLite `seen_ips`/`seen_subnets` from the legacy JSON state so day one isn't all "new" |
+| [`geo_lists.py`](geo_lists.py) | Local "covering range" lookup over the same `.lst` files `update_geo_lists.py` writes — Suricata IP Reputation only reports category+score, not which CIDR matched |
+| [`update_geo_lists.py`](update_geo_lists.py) | Daily cron: fetches iwik.org/Spamhaus DROP, writes IP Reputation source files, triggers a live Suricata reload |
+| [`geo-spamhaus.rules`](geo-spamhaus.rules) | GEO-BLOCK-\*/SPAMHAUS-BLOCK-\* signatures for Step 4b |
+| [`test_geo_spamhaus_smoke.py`](test_geo_spamhaus_smoke.py) | Smoke test for the geo/Spamhaus pipeline against a mocked MikroTik REST API — no live router/Suricata needed |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | System architecture — components, data flow, DB schema, deploy topology |
+| [`FUNCTIONALITY.md`](FUNCTIONALITY.md) | What the code actually does, function by function |
+| [`CONTEXT.md`](CONTEXT.md) | Domain glossary |
+| [`PROJECT_HISTORY.md`](PROJECT_HISTORY.md) | Historical specs/plan/ADRs — how decisions were made, not current state |
+| [`TODO.md`](TODO.md) | Prioritized improvement plan |
 | [`env.example`](env.example) | Secrets/deployment template (Telegram, MikroTik, WAN IPs) → copy to `/opt/alert-bridge/env` |
 | [`alert-bridge.cfg.example`](alert-bridge.cfg.example) | Blocking/anomaly threshold template → copy to `/opt/alert-bridge/alert-bridge.cfg` |
