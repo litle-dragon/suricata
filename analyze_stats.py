@@ -906,6 +906,7 @@ def _render_slot_row(mod, r: sqlite3.Row) -> str:
         spamhaus_new_count=r["spamhaus_new_count"] or 0,
         geo_new_list=json.loads(r["geo_new_list_json"]) if "geo_new_list_json" in keys and r["geo_new_list_json"] else [],
         spamhaus_new_list=json.loads(r["spamhaus_new_list_json"]) if "spamhaus_new_list_json" in keys and r["spamhaus_new_list_json"] else [],
+        geo_spamhaus_top=json.loads(r["geo_top_json"]) if "geo_top_json" in keys and r["geo_top_json"] else [],
     )
     return "\n".join(lines)
 
@@ -928,6 +929,7 @@ def _render_daily_row(mod, r: sqlite3.Row) -> str:
         spamhaus_new_count=r["spamhaus_new_count"] or 0,
         geo_new_list=json.loads(r["geo_new_list_json"]) if "geo_new_list_json" in keys and r["geo_new_list_json"] else [],
         spamhaus_new_list=json.loads(r["spamhaus_new_list_json"]) if "spamhaus_new_list_json" in keys and r["spamhaus_new_list_json"] else [],
+        geo_spamhaus_top=json.loads(r["geo_top_json"]) if "geo_top_json" in keys and r["geo_top_json"] else [],
     )
     return "\n".join(lines)
 
