@@ -890,6 +890,7 @@ def _load_alert_bridge_module():
 
 def _render_slot_row(mod, r: sqlite3.Row) -> str:
     header = f"📊 6-годинний дайджест нових загроз\nПеріод: {r['start_time']} - {r['end_time']} ({r['date']})"
+    keys = r.keys()
     lines = mod._build_periodic_report_lines(
         header, r["total_alerts"], r["new_ips_count"], r["new_subnets_count"],
         r["avg_alerts_per_ip"], r["avg_alerts_per_subnet"],
@@ -903,12 +904,15 @@ def _render_slot_row(mod, r: sqlite3.Row) -> str:
         spamhaus_count=r["spamhaus_count"] or 0,
         geo_new_counts=json.loads(r["geo_new_counts_json"]) if r["geo_new_counts_json"] else {},
         spamhaus_new_count=r["spamhaus_new_count"] or 0,
+        geo_new_list=json.loads(r["geo_new_list_json"]) if "geo_new_list_json" in keys and r["geo_new_list_json"] else [],
+        spamhaus_new_list=json.loads(r["spamhaus_new_list_json"]) if "spamhaus_new_list_json" in keys and r["spamhaus_new_list_json"] else [],
     )
     return "\n".join(lines)
 
 
 def _render_daily_row(mod, r: sqlite3.Row) -> str:
     header = f"🌅 Звіт за попередній день ({r['date']}) 📊"
+    keys = r.keys()
     lines = mod._build_periodic_report_lines(
         header, r["total_alerts"], r["new_ips_count"], r["new_subnets_count"],
         r["avg_alerts_per_ip"], r["avg_alerts_per_subnet"],
@@ -922,6 +926,8 @@ def _render_daily_row(mod, r: sqlite3.Row) -> str:
         spamhaus_count=r["spamhaus_count"] or 0,
         geo_new_counts=json.loads(r["geo_new_counts_json"]) if r["geo_new_counts_json"] else {},
         spamhaus_new_count=r["spamhaus_new_count"] or 0,
+        geo_new_list=json.loads(r["geo_new_list_json"]) if "geo_new_list_json" in keys and r["geo_new_list_json"] else [],
+        spamhaus_new_list=json.loads(r["spamhaus_new_list_json"]) if "spamhaus_new_list_json" in keys and r["spamhaus_new_list_json"] else [],
     )
     return "\n".join(lines)
 
