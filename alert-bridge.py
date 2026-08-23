@@ -483,12 +483,29 @@ def db_init() -> None:
     _all_time_subnet_ips = defaultdict(set)
     for ip in _all_time_seen_ips:
         _all_time_subnet_ips[get_subnet(ip)].add(ip)
-    _permanently_blocked_ips = {
-        row[0] for row in _conn.execute("SELECT ip_or_subnet FROM permanent_blocks WHERE kind='ip'")
-    }
-    _permanently_blocked_subnets = {
-        row[0] for row in _conn.execute("SELECT ip_or_subnet FROM permanent_blocks WHERE kind='subnet'")
-    }
+    # Bug fixed 2026-08-23: this used to filter WHERE kind='ip'/'subnet', silently
+    # excluding every geo-*/spamhaus permanent block from the in-memory
+    # already-blocked cache after every restart. Consequence: the first hit
+    # against any previously-blocked geo/spamhaus range after a restart looked
+    # "not already blocked", triggered a redundant mikrotik_block() PUT (MikroTik
+    # itself no-ops it via "already have such entry"), and inflated the live
+    # session's new-block counters/lists (db_record_permanent_block()'s INSERT OR
+    # IGNORE correctly no-ops on the DB side, but the in-memory counters/lists
+    # above it aren't gated on that outcome) -- caught via restore_period_state()
+    # producing a *lower*, DB-verified count than the live pre-restart session had.
+    # Bucket by the string's own shape (single address vs network), not by the
+    # `kind` label, so every pipeline (regular + geo/spamhaus) is covered uniformly.
+    _permanently_blocked_ips = set()
+    _permanently_blocked_subnets = set()
+    for (addr,) in _conn.execute("SELECT ip_or_subnet FROM permanent_blocks"):
+        try:
+            net = ipaddress.ip_network(addr, strict=False)
+            if net.prefixlen == net.max_prefixlen:
+                _permanently_blocked_ips.add(addr)
+            else:
+                _permanently_blocked_subnets.add(addr)
+        except ValueError:
+            _permanently_blocked_ips.add(addr)
     _subnet_active_days = defaultdict(set)
     for subnet, day in _conn.execute("SELECT subnet, day FROM subnet_active_days"):
         _subnet_active_days[subnet].add(day)
