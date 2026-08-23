@@ -1,3 +1,12 @@
+> ⚠️ **Історичний документ, застарілий станом на 2026-08-23.** Це первісна
+> проєктна специфікація (написана до впровадження geo/Spamhaus-конвеєра,
+> `service_events`, `hit_log`/`restore_period_state`, `--messages`,
+> `SIGUSR1`/`SIGUSR2`). Схема БД і формати повідомлень нижче більше **не**
+> відповідають коду один в один — залишено як запис первісного дизайну, не
+> як джерело правди. **Актуальний опис функціоналу** — `FUNCTIONALITY.md`
+> (по коду) і `ARCHITECTURE.md` (загальна архітектура); актуальна
+> термінологія — `CONTEXT.md`.
+
 # Specification: Suricata Alert Reporting & SQLite Architecture (`spec.md`)
 
 ## 1. Overview & Context

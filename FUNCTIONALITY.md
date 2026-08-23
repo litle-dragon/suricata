@@ -72,11 +72,28 @@ IPv4 → `/24`, IPv6 → `/64`. Вся статистика і поріг бло
 Для outbound — просто рахує лічильник за добу, без all-time трекінгу.
 
 ### Аудит постійних блоків — `permanent_blocks` (SQLite) + in-memory сети
-Шоста таблиця: `permanent_blocks(ip_or_subnet, kind, signature, blocked_at)`,
-унікальний індекс на адресу. При старті демон завантажує з неї два сети в
-пам'ять: `_permanently_blocked_ips`, `_permanently_blocked_subnets` — кеш
-"що вже точно заблоковано постійно", щоб не питати MikroTik REST на кожен
-алерт. Кожен успішний постійний блок (з будь-якої з трьох гілок нижче)
+Таблиця `permanent_blocks(ip_or_subnet, kind, signature, blocked_at)`,
+унікальний індекс на адресу. `kind` — `"ip"`/`"subnet"` (звичайний
+pipeline) або `"geo-<cc>"`/`"spamhaus"` (geo/spamhaus pipeline, див. нижче).
+При старті демон завантажує **з усіх рядків незалежно від `kind`** два
+сети в пам'ять: `_permanently_blocked_ips`, `_permanently_blocked_subnets`
+— кеш "що вже точно заблоковано постійно", щоб не питати MikroTik REST на
+кожен алерт. Бакетизація — за формою самої адреси (`ipaddress`: одинична
+адреса → `_permanently_blocked_ips`, мережа з prefixlen < max →
+`_permanently_blocked_subnets`), не за текстовим `kind`-лейблом.
+
+**Баг, виправлений 2026-08-23:** до фіксу завантаження фільтрувало
+`WHERE kind='ip'`/`kind='subnet'`, повністю ігноруючи `geo-*`/`spamhaus`
+рядки. Наслідок: після **кожного** рестарту перший хіт по вже назавжди
+заблокованому geo/spamhaus-діапазону виглядав "не заблокованим" —
+тригерив зайвий `mikrotik_block()` (MikroTik коректно no-op'ив через
+"already have such entry") і роздував лічильники нових блоків у дайджесті
+(`db_record_permanent_block()`'s `INSERT OR IGNORE` коректно ігнорував
+дублікат на боці БД, але нічого не гейтило інкремент лічильника на цьому).
+Знайдено звіркою живого лічильника з прямим SQL-запитом до
+`permanent_blocks` під час тестування `restore_period_state()` (нижче).
+
+Кожен успішний постійний блок (з будь-якої гілки, обох пайплайнів)
 дописує рядок через `db_record_permanent_block()`.
 
 ### Перевірка "підмережа вже заблокована" — єдина точка входу для ВСІХ attempts
@@ -262,22 +279,108 @@ HTTP 200 від Bot API. Кожен щойно збудований звіт (6h
 пише "log only" (блокування працює без сповіщень). Підтримує форум-тред
 (`message_thread_id`).
 
+
+### GEO/Spamhaus pipeline — паралельний конвеєр (`main()`, гілка `category is not None`)
+`classify_category(sig)` розпізнає `GEO-BLOCK-<CC>-IN/OUT`/`SPAMHAUS-BLOCK-IN/OUT`
+сигнатури (окремий rule-файл `geo-spamhaus.rules`, IP Reputation — ADR-0003)
+і повертає `("geo", "<cc>")`/`("spamhaus", None)`. Свідомо **не** проходить
+через `record_hit()`/`seen_ips`/`seen_subnets` (ADR-0002) — власний,
+паралельний шлях:
+1. `geo_lists.covering_range()` визначає "охоплюючий діапазон" (Suricata
+   iprep каже лише категорію+score, не яка саме CIDR збіглася).
+2. `already_blocked` — перевірка проти того самого спільного кешу
+   `_permanently_blocked_ips`/`_permanently_blocked_subnets`, що й
+   звичайний pipeline (див. "Аудит постійних блоків" вище).
+3. Якщо ні — **негайний** постійний блок (без ескалації/cooldown,
+   `mikrotik_block(..., block_list=suricata-geo-block/suricata-spamhaus-block)`),
+   аудит у `permanent_blocks` (`kind=geo-<cc>`/`spamhaus`).
+4. Лічильники: **hits** (`_slot_geo_counts`/`_slot_spamhaus_count` —
+   кожен matched alert, включно з повторними хітами вже заблокованого
+   діапазону) окремо від **new-block** (`_slot_geo_new_counts`/
+   `_slot_spamhaus_new_count` + списки адрес `_slot_geo_new_list`/
+   `_slot_spamhaus_new_list` — лише коли `mikrotik_block()` реально щось
+   заблокував уперше). Розділення важливе: hits — обсяг трафіку, new-block
+   — те, що звіряється з розміром MikroTik-списку.
+5. `_slot_geo_spamhaus_subnets`/`_daily_geo_spamhaus_subnets` — окрема
+   агрегація `{covering_range/IP: {ips: set, alerts: int, label: CC}}` для
+   ТОП10 (нижче), ключ — фактичний `covering_range`/IP (не примусовий
+   `/24` — geo-списки мають різні префікси /12…/24+).
+
+### ТОП10 GEO/Spamhaus за алертами — `_geo_spamhaus_top()`/`_format_geo_spamhaus_top_lines()`
+Окремий від звичайного ТОП10 (`_top_and_singles()` бачить лише
+`_slot_inbound_subnets`, populated тільки в `record_hit()` — geo/spamhaus
+туди фізично не потрапляє). Топ-10 за `alerts` з 2+ унікальних IP,
+**навмисно без фільтра "вже заблоковано"** — geo/spamhaus блокує з 1-ї
+спроби (ADR-0002), фільтр залишив би ТОП майже завжди пустим. Формат:
+прапор-емодзі (`GEO_SPAMHAUS_EMOJI`) + код країни/`Spamhaus` + діапазон +
+IP/алерти/середнє.
+
+### Restart-safe стан слота/доби — `hit_log` + `restore_period_state()`
+Лічильники обсягу алертів (`_slot_alerts_count`, `_slot_inbound_counts`,
+`_slot_inbound_subnets`, geo/spamhaus hit-лічильники, `_slot_geo_spamhaus_subnets`)
+були чисто in-memory — рестарт (деплой/краш) мовчки обнуляв частковий
+прогрес поточного слота/доби. Таблиця `hit_log(day, slot_index, pipeline,
+bucket, ip, alerts)` — `pipeline` кодує `inbound`/`geo-<cc>`/`spamhaus`
+(лейбл виводиться з колонки, без окремого поля), UPSERT на кожен алерт
+(`record_hit_log()`, той самий патерн, що вже є для `seen_ips`/
+`subnet_daily_ips`). Пруниться цілком по дню при опівнічному ресеті
+(`_reset_daily_state`), не по слоту.
+
+`restore_period_state()` викликається з `main()` одразу після `db_init()`,
+до `resend_missed_reports()`/початку обробки нових алертів. Відновлює:
+- обсяг алертів (з `hit_log`, обидва пайплайни, слот і доба окремо);
+- нові IP/підмережі (з `seen_ips`/`seen_subnets.first_seen` — уже
+  персистентні, просто раніше не читались назад);
+- перманентні блоки/нові geo-блоки (з `permanent_blocks.blocked_at` — так
+  само вже персистентні).
+`_period_utc_bounds(day, slot_index)` конвертує локальні межі
+дня/слота в UTC-рядки для порівняння з SQLite `CURRENT_TIMESTAMP`
+(завжди UTC, сервер — Europe/Kyiv UTC+3, перевірено що це реально має
+значення, не захисне програмування).
+
+### Повідомлення без структурного сховища — `service_events` + `archive_send()`
+Slot/daily/spike-звіти повністю відновлювані зі своїх структурованих
+колонок (той самий форматер, що й оригінал) — дублювання тексту не
+потрібне. `service_events(id, ts, kind, text, delivered)` покриває лише
+те, що іншого сховища не має: banner старту/стопу сервісу
+(`kind=lifecycle-start/stop`), `reconcile_slot_blocks()`-summary
+(`kind=reconcile`), on-demand-снепшоти (`kind=slot-ondemand`/
+`daily-ondemand`, нижче). `archive_send(text, kind)` — обгортка навколо
+`telegram_send()`, пише рядок незалежно від успіху доставки (`delivered`
+відображає реальний статус).
+
+### Позачергові звіти — `SIGUSR1`/`SIGUSR2`
+`systemctl kill -s SIGUSR1 alert-bridge` (поточний слот, дані станом на
+момент запиту) / `SIGUSR2` (поточна доба) — обробники сигналів лише
+виставляють прапорець (`_ondemand_slot_requested`/`_ondemand_daily_requested`),
+фактична відправка відбувається в `check_periodic_tasks()` на наступному
+тіку `follow()`-циклу (той самий шаблон, що й `_shutdown_requested`).
+`send_slot_digest_ondemand()`/`send_daily_report_ondemand()` рендерять
+через **той самий** `_build_periodic_report_lines()`, що й плановий звіт
+(заголовок позначений "ПОЗАЧЕРГОВО"), не скидають і не пишуть у
+`slot_digests`/`daily_stats` — плановий звіт далі йде за розкладом
+незалежно.
+
 ### Персистентність — SQLite (WAL mode)
 `_conn = sqlite3.connect(..., isolation_level=None)` — autocommit,
 `PRAGMA journal_mode=WAL` + `synchronous=NORMAL` — компроміс швидкість/
-надійність при можливому крешу. Вісім таблиць: `seen_ips`, `seen_subnets`
-(all-time унікальність), `daily_stats` (архів по днях, тепер + `sent`,
-`new_ips_json`, `new_subnets_json`, `perm_ips_json`, `perm_subnets_json`),
-`slot_digests` (архів 6-годинних дайджестів, ті самі чотири нові колонки),
-`spike_events` (лог аномалій, + `sent`), `permanent_blocks` (аудит
-постійних блоків — хто, коли, звідки), `subnet_active_days` (multi-day
-override, дивись вище) і `subnet_daily_ips` (restart-safe лічильник
-унікальних IP за поточний день на підмережу, обмежений лише сьогоднішнім
-днем — дивись multi-day override вище).
-Нові колонки додаються через `SCHEMA_MIGRATIONS` — список `ALTER TABLE ...
+надійність при можливому крешу. Десять таблиць: `seen_ips`, `seen_subnets`
+(all-time унікальність), `daily_stats`/`slot_digests` (архів звітів —
+повний набір колонок: `sent`, `new_ips_json`/`new_subnets_json`,
+`perm_ips_json`/`perm_subnets_json`, `geo_counts_json`/`spamhaus_count`,
+`geo_new_counts_json`/`spamhaus_new_count`, `geo_new_list_json`/
+`spamhaus_new_list_json`, `geo_top_json`), `spike_events` (лог аномалій,
++ `sent`), `permanent_blocks` (аудит постійних блоків — хто, коли,
+звідки, обидва пайплайни), `subnet_active_days`/`subnet_daily_ips`
+(multi-day override, дивись вище), `service_events` (повідомлення без
+іншого структурного сховища, дивись вище) і `hit_log` (restart-safe
+обсяг алертів, дивись вище).
+Нові колонки додаються через `_SCHEMA_MIGRATIONS` — список `ALTER TABLE ...
 ADD COLUMN`, застосовується ідемпотентно при кожному старті (ловить і
 ігнорує "duplicate column" від SQLite, якщо міграція вже застосована) —
-безпечно для БД, яка вже накопичила історію до цього релізу.
+безпечно для БД, яка вже накопичила історію до цього релізу. Нові таблиці
+(`service_events`, `hit_log`) — просто `CREATE TABLE IF NOT EXISTS`, без
+міграції.
 
 ---
 
@@ -359,6 +462,18 @@ ADD COLUMN`, застосовується ідемпотентно при кож
   `PUT` з коментарем `PERMANENT: <причина>`, після чого перевірка
   повторюється проти **реального** пост-фікс стану роутера (не вважає
   кожен `PUT` успішним автоматично).
+
+- `--messages [--kind slot|daily|spike|service|all] [--hours N] [--days N]
+  [--date D] [--from .. --to ..]`: показує архівовані повідомлення,
+  реконструйовані **тим самим** форматером, що й оригінал
+  (`_build_periodic_report_lines`/`_format_top_lines`, лениво імпортовані з
+  `alert-bridge.py` через `importlib` — hyphenated filename не
+  імпортується напряму). `slot`/`daily`/`spike` читаються зі своїх
+  структурованих колонок (нічого не дублюється); `service` — з
+  `service_events`, вербатим. Фільтри комбінуються вільно: `--hours`/
+  `--from`/`--to` порівнюються проти UTC-колонок SQLite
+  (`_local_to_utc_str()` конвертує локальний ввід користувача), `--days`/
+  `--date` — проти локального календарного `date`.
 
 Усі write-команди (`--sync-mikrotik`, `--merge-adjacent`, `--verify-blocks
 --fix`) логують ключові дії через syslog (`_jlog`, `facility=LOG_DAEMON`) —

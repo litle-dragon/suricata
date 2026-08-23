@@ -12,7 +12,7 @@
 _Avoid_: temporary ban
 
 **Постійний блок**:
-Запис у MikroTik address-list без timeout, з коментарем `PERMANENT: ...`, назавжди. Кожен постійний блок аудиться в таблиці `permanent_blocks` (`ip_or_subnet`, `kind`, `signature`, `blocked_at`) і кешується в пам'яті (`_permanently_blocked_ips`/`_permanently_blocked_subnets`), щоб не переопитувати MikroTik на кожен наступний алерт.
+Запис у MikroTik address-list без timeout, з коментарем `PERMANENT: ...`, назавжди. Кожен постійний блок аудиться в таблиці `permanent_blocks` (`ip_or_subnet`, `kind`, `signature`, `blocked_at`) і кешується в пам'яті (`_permanently_blocked_ips`/`_permanently_blocked_subnets`), щоб не переопитувати MikroTik на кожен наступний алерт. Кеш завантажується при старті **з усіх рядків незалежно від `kind`** (виправлено 2026-08-23 — раніше фільтр `WHERE kind='ip'/'subnet'` мовчки губив geo/spamhaus-блоки з кешу після кожного рестарту), бакетизація за формою адреси (одинична vs мережа), не за текстовим `kind`.
 _Avoid_: permanent ban
 
 **Спроба** (attempt):
@@ -40,6 +40,18 @@ inbound — джерело поза HOME_NETS, ціль усередині (що
 **Аномальний сплеск (spike)**:
 Подія, коли кількість inbound-алертів у ковзному 5-хвилинному вікні (`SLIDING_WINDOW`) перетинає `SPIKE_THRESHOLD_N` — єдина подія, що пейджить у Telegram у реальному часі; не впливає на рішення про блокування (воно йде окремим шляхом).
 
-**Категорія алерту** (нова):
+**Категорія алерту**:
 `geo-<CC>` (`geo-ru`/`geo-by`/`geo-cn`/`geo-kp`/`geo-ir`) чи `spamhaus` — записується як `kind` у `permanent_blocks`, той самий audit-механізм і кеш, що й для звичайних постійних блоків, але власний, паралельний конвеєр обробки: блок одразу на першому алерті (без спроб/ескалації/cooldown), не проходить через `record_hit()`/`seen_ips` uniqueness. На MikroTik групується по 2 списках за категорією (`suricata-geo-block` — усі 5 країн разом, `suricata-spamhaus-block` — окремо), не по країні; розбивка по країні лишається в звітах і `analyze_stats.py`.
-</content>
+
+**Hit** vs **New block** (geo/spamhaus):
+Hit — кожен алерт, що зматчився під geo/spamhaus-сигнатуру, включно з повторним трафіком від уже заблокованого діапазону (`_slot_geo_counts`/`_slot_spamhaus_count`, рядки `🌍 Geo-block:`/`🚫 Spamhaus-block:` у звіті — обсяг трафіку). New block — підмножина hits, де `mikrotik_block()` реально додав новий запис уперше (`_slot_geo_new_counts`/`*_new_list`, рядок "Додано в GEO/Spamhaus блок" — звіряти саме це число з розміром MikroTik-списку, не hits). Розділено 2026-08-23 — до того лічильник у звіті рахував hits, підписаний як "блок".
+_Avoid_: використовувати hit-лічильник як міру нових блокувань
+
+**Restart-safe стан**:
+Слот/добові лічильники обсягу алертів (не блоків) — чисто in-memory, губились на рестарті. `hit_log(day, slot_index, pipeline, bucket, ip, alerts)` — UPSERT на кожен алерт, `restore_period_state()` відновлює `_slot_*`/`_daily_*` при старті з трьох джерел: `hit_log` (обсяг), `seen_ips`/`seen_subnets.first_seen` (нові IP/підмережі — вже персистились, просто не читались назад), `permanent_blocks.blocked_at` (перманентні блоки). Введено 2026-08-23.
+
+**service_events**:
+Таблиця для повідомлень без іншого структурного сховища — старт/стоп сервісу, `reconcile_slot_blocks()`-summary, on-demand-снепшоти. Slot/daily/spike-звіти **не** сюди — вони повністю відновлювані зі своїх структурованих колонок тим самим форматером, дублювання тексту уникнуто навмисно.
+
+**Позачерговий звіт** (on-demand):
+`SIGUSR1`/`SIGUSR2` до запущеного демона — поточний слот/добу "як є", тим самим форматером, що й плановий звіт, позначений "ПОЗАЧЕРГОВО". Не скидає лічильники, не пише в `slot_digests`/`daily_stats` — плановий звіт іде за розкладом окремо.
