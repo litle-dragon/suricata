@@ -877,6 +877,45 @@ CIDRs directly on the router (e.g. two neighboring `/24`s become one `/23`):
 sudo python3 /opt/alert-bridge/analyze_stats.py --merge-adjacent
 ```
 
+### 8f. Ad-hoc / on-demand report + message search
+
+Need a report right now instead of waiting for the next slot boundary or
+07:00? Signal the running service directly — no extra tooling, same pattern
+as the existing `SIGTERM`/`SIGINT` graceful-stop handling:
+
+```bash
+sudo systemctl kill -s SIGUSR1 alert-bridge   # current 6h slot, data-so-far
+sudo systemctl kill -s SIGUSR2 alert-bridge   # current day, data-so-far
+```
+
+Both render through the exact same formatter as the real scheduled digest —
+same layout, same fields — with the header marked "ПОЗАЧЕРГОВО" and the data
+timestamped to the moment of the request. Neither resets any counter or
+writes to `slot_digests`/`daily_stats`: the real end-of-slot digest and
+07:00 report still fire on schedule afterward, unaffected.
+
+Every message the service has ever sent — scheduled or on-demand — is
+queryable and reprintable in the exact text Telegram received:
+
+```bash
+# Periodic (6h) digests from the last N hours — daily reports excluded
+sudo python3 /opt/alert-bridge/analyze_stats.py --messages --kind slot --hours 12
+
+# Daily reports for the last N days
+sudo python3 /opt/alert-bridge/analyze_stats.py --messages --kind daily --days 7
+
+# The daily report covering one specific date
+sudo python3 /opt/alert-bridge/analyze_stats.py --messages --kind daily --date 2026-08-21
+
+# Everything (any kind) covering one date, or an explicit range
+sudo python3 /opt/alert-bridge/analyze_stats.py --messages --date 2026-08-21
+sudo python3 /opt/alert-bridge/analyze_stats.py --messages --from "2026-08-20 08:00" --to "2026-08-21 20:00"
+```
+
+`--kind` accepts `slot` / `daily` / `spike` / `service` / `all` (default).
+`service` covers what has no other structured home: startup/shutdown
+banners, slot-reconcile batch summaries, and on-demand snapshots.
+
 ## Step 9 — Prove the whole loop
 
 From an **external** host (a VPS, or a phone hotspot — a scan from inside the
@@ -1003,9 +1042,9 @@ sudo tail -f /var/log/suricata/eve.json | jq -c 'select(.event_type=="alert") | 
 
 | File | Purpose |
 |---|---|
-| [`alert-bridge.py`](alert-bridge.py) | Tails `eve.json`, blocks attackers via the MikroTik REST API, records to SQLite, and pages Telegram on spikes/digests |
+| [`alert-bridge.py`](alert-bridge.py) | Tails `eve.json`, blocks attackers via the MikroTik REST API, records to SQLite, and pages Telegram on spikes/digests; `SIGUSR1`/`SIGUSR2` send an on-demand slot/daily snapshot |
 | [`alert-bridge.service`](alert-bridge.service) | systemd unit for the bridge |
-| [`analyze_stats.py`](analyze_stats.py) | Queries the SQLite database — daily summaries, spike log, top attackers, real addresses, subnet cleanup (`--sum` / `--day` / `--spikes` / `--top` / `--list` / `--list-out` / `--sync-mikrotik` / `--merge-adjacent` / `--verify-blocks` / `--fix`) |
+| [`analyze_stats.py`](analyze_stats.py) | Queries the SQLite database — daily summaries, spike log, top attackers, real addresses, subnet cleanup, sent-message search (`--sum` / `--day` / `--spikes` / `--top` / `--list` / `--list-out` / `--sync-mikrotik` / `--merge-adjacent` / `--verify-blocks` / `--fix` / `--messages`) |
 | [`sync-state-from-journal.py`](sync-state-from-journal.py) | Legacy — rebuilt the old JSON state from `journalctl`; unused since the SQLite migration |
 | [`migrate_json_to_sqlite.py`](migrate_json_to_sqlite.py) | One-time — seeds SQLite `seen_ips`/`seen_subnets` from the legacy JSON state so day one isn't all "new" |
 | [`env.example`](env.example) | Secrets/deployment template (Telegram, MikroTik, WAN IPs) → copy to `/opt/alert-bridge/env` |

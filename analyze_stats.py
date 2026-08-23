@@ -26,6 +26,19 @@ Reads /var/log/suricata/alert_bridge.db directly (no journal parsing):
                         list. An entry is fine if present exactly OR covered by a wider
                         subnet already there (e.g. after --merge-adjacent); only a truly
                         absent entry is reported as missing.
+  --messages             Show archived sent messages (slot digests, daily reports, spike
+                        alerts, service events) reconstructed in the exact text Telegram
+                        received, not a re-derived summary. Combine with:
+                          --kind {slot,daily,spike,service,all}  (default: all)
+                          --hours N     messages sent in the last N hours
+                          --days N      messages covering the last N calendar days
+                          --date D      messages covering exactly this calendar date
+                          --from/--to   explicit sent-at range ('YYYY-MM-DD[ HH:MM]',
+                                        interpreted as local time)
+                        Examples: --messages --kind slot --hours 6 (periodic digests
+                        from the last 6 hours, no daily reports); --messages --kind
+                        daily --days 7 (daily reports for the last week); --messages
+                        --date 2026-08-21 (everything covering that one day).
 
 With no mode given, prints the --sum summary.
 
@@ -36,6 +49,7 @@ so its stdout isn't captured by journald unless explicitly logged.
 
 import argparse
 import configparser
+import importlib.util
 import ipaddress
 import json
 import os
@@ -43,6 +57,7 @@ import sqlite3
 import sys
 import syslog
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 try:
     import requests
@@ -850,6 +865,210 @@ def sync_subnets_to_mikrotik(conn: sqlite3.Connection, subnets_to_block: list[tu
           f"{cleanup_skipped_no_list} skipped cleanup")
 
 
+# ── --messages: show what the service actually sent ────────────────────────
+# Reuses alert-bridge.py's own report formatter so the printed text is
+# byte-identical to what Telegram received, instead of a re-derived summary
+# in analyze_stats.py's own (different) table format. slot_digests/
+# daily_stats/spike_events already carry the structured data needed to
+# reconstruct the original message; only service_events (lifecycle/
+# reconcile/on-demand) stores literal text, since those have no other
+# structured home.
+
+_ALERT_BRIDGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert-bridge.py")
+
+
+def _load_alert_bridge_module():
+    """Lazy import of alert-bridge.py (hyphenated filename -> not import-able
+    with a plain `import`) purely for its pure-formatting functions
+    (_build_periodic_report_lines / _format_top_lines). No DB connection or
+    network call happens at import time."""
+    spec = importlib.util.spec_from_file_location("_alert_bridge_fmt", _ALERT_BRIDGE_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _render_slot_row(mod, r: sqlite3.Row) -> str:
+    header = f"📊 6-годинний дайджест нових загроз\nПеріод: {r['start_time']} - {r['end_time']} ({r['date']})"
+    lines = mod._build_periodic_report_lines(
+        header, r["total_alerts"], r["new_ips_count"], r["new_subnets_count"],
+        r["avg_alerts_per_ip"], r["avg_alerts_per_subnet"],
+        r["perm_ips_count"], r["perm_subnets_count"], r["single_ips_count"], r["single_ips_alerts"],
+        json.loads(r["top_subnets_json"]), "6 годин",
+        new_ips_list=json.loads(r["new_ips_json"]) if r["new_ips_json"] else [],
+        new_subnets_list=json.loads(r["new_subnets_json"]) if r["new_subnets_json"] else [],
+        perm_ips_list=json.loads(r["perm_ips_json"]) if r["perm_ips_json"] else [],
+        perm_subnets_list=json.loads(r["perm_subnets_json"]) if r["perm_subnets_json"] else [],
+        geo_counts=json.loads(r["geo_counts_json"]) if r["geo_counts_json"] else {},
+        spamhaus_count=r["spamhaus_count"] or 0,
+        geo_new_counts=json.loads(r["geo_new_counts_json"]) if r["geo_new_counts_json"] else {},
+        spamhaus_new_count=r["spamhaus_new_count"] or 0,
+    )
+    return "\n".join(lines)
+
+
+def _render_daily_row(mod, r: sqlite3.Row) -> str:
+    header = f"🌅 Звіт за попередній день ({r['date']}) 📊"
+    lines = mod._build_periodic_report_lines(
+        header, r["total_alerts"], r["new_ips_count"], r["new_subnets_count"],
+        r["avg_alerts_per_ip"], r["avg_alerts_per_subnet"],
+        r["perm_ips_count"], r["perm_subnets_count"], r["single_ips_count"], r["single_ips_alerts"],
+        json.loads(r["top_subnets_json"]), "добу",
+        new_ips_list=json.loads(r["new_ips_json"]) if r["new_ips_json"] else [],
+        new_subnets_list=json.loads(r["new_subnets_json"]) if r["new_subnets_json"] else [],
+        perm_ips_list=json.loads(r["perm_ips_json"]) if r["perm_ips_json"] else [],
+        perm_subnets_list=json.loads(r["perm_subnets_json"]) if r["perm_subnets_json"] else [],
+        geo_counts=json.loads(r["geo_counts_json"]) if r["geo_counts_json"] else {},
+        spamhaus_count=r["spamhaus_count"] or 0,
+        geo_new_counts=json.loads(r["geo_new_counts_json"]) if r["geo_new_counts_json"] else {},
+        spamhaus_new_count=r["spamhaus_new_count"] or 0,
+    )
+    return "\n".join(lines)
+
+
+def _render_spike_row(mod, r: sqlite3.Row) -> str:
+    # single_ips_count/single_ips_alerts were never persisted for spike_events
+    # (send_spike_alert computes them from the live sliding window, not
+    # stored) -- reconstruction is honest about that gap rather than
+    # guessing.
+    top = json.loads(r["top_subnets_json"])
+    lines = [
+        "🚨 АНОМАЛЬНИЙ СПЛЕСК АТАК (Spike Alert) ⚠️",
+        f"Період: {r['start_time']} - {r['end_time']} (останні 5 хвилин)",
+        "",
+        f"• Всього алертів за 5 хв: {r['total_alerts']:,}",
+        f"• Середня інтенсивність: {r['avg_rate_per_min']:,} алертів/хв",
+        f"• Унікальних IP-атакуючих: {r['unique_ips']:,}",
+        "",
+    ]
+    if top:
+        lines += mod._format_top_lines(top)
+        lines.append("")
+    lines.append("(розбивка на поодинокі нові IP для спалахів не архівується окремо)")
+    return "\n".join(lines)
+
+
+_MESSAGE_KIND_QUERIES = {
+    "slot": ("slot_digests", "date", "created_at", _render_slot_row),
+    "daily": ("daily_stats", "date", "created_at", _render_daily_row),
+    "spike": ("spike_events", "DATE(timestamp)", "timestamp", _render_spike_row),
+}
+
+
+def _local_to_utc_str(local_str: str) -> str:
+    """User-supplied --from/--to are typed in the operator's own local wall-clock
+    (everything else in this tool and in alert-bridge.py's report headers is
+    displayed in local time) -- but created_at/timestamp/ts columns are SQLite
+    CURRENT_TIMESTAMP, which is always UTC. Convert before comparing, or a
+    server not running in UTC (e.g. Europe/Kyiv, UTC+3) silently shifts every
+    --from/--to/--hours window by the zone offset."""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            local_dt = datetime.strptime(local_str, fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        raise ValueError(f"unrecognized date/time: {local_str!r} (use 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM')")
+    offset = datetime.now() - datetime.utcnow()  # local wall-clock minus UTC, ~current DST-aware offset
+    return (local_dt - offset).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _messages_window(hours: int | None, days: int | None, date: str | None,
+                      dt_from: str | None, dt_to: str | None) -> tuple[str | None, str | None, str | None, str | None]:
+    """Computes the two possible cutoffs callers need: a calendar-day floor/
+    ceiling (for --days/--date, compared against the `date` column, which
+    alert-bridge.py writes as a local calendar date) and a UTC timestamp
+    floor/ceiling (for --hours/--from/--to, compared against created_at/
+    timestamp/ts, which SQLite always stamps in UTC)."""
+    day_from = day_to = None
+    ts_from = ts_to = None
+    if date:
+        day_from = day_to = date
+    if days is not None:
+        day_from = (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    if hours is not None:
+        ts_from = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    if dt_from:
+        ts_from = _local_to_utc_str(dt_from)
+    if dt_to:
+        ts_to = _local_to_utc_str(dt_to)
+    return day_from, day_to, ts_from, ts_to
+
+
+def _fetch_kind_rows(conn: sqlite3.Connection, table: str, day_col: str, ts_col: str,
+                      day_from, day_to, ts_from, ts_to) -> list[sqlite3.Row]:
+    clauses, params = [], []
+    if day_from:
+        clauses.append(f"{day_col} >= ?"); params.append(day_from)
+    if day_to:
+        clauses.append(f"{day_col} <= ?"); params.append(day_to)
+    if ts_from:
+        clauses.append(f"{ts_col} >= ?"); params.append(ts_from)
+    if ts_to:
+        clauses.append(f"{ts_col} <= ?"); params.append(ts_to)
+    sql = f"SELECT * FROM {table}"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += f" ORDER BY {ts_col}"
+    return list(conn.execute(sql, params))
+
+
+def _fetch_service_rows(conn: sqlite3.Connection, day_from, day_to, ts_from, ts_to) -> list[sqlite3.Row]:
+    clauses, params = [], []
+    if day_from:
+        clauses.append("DATE(ts) >= ?"); params.append(day_from)
+    if day_to:
+        clauses.append("DATE(ts) <= ?"); params.append(day_to)
+    if ts_from:
+        clauses.append("ts >= ?"); params.append(ts_from)
+    if ts_to:
+        clauses.append("ts <= ?"); params.append(ts_to)
+    sql = "SELECT * FROM service_events"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY ts"
+    try:
+        return list(conn.execute(sql, params))
+    except sqlite3.OperationalError:
+        return []  # DB predates the service_events migration
+
+
+def cmd_messages(conn: sqlite3.Connection, kind: str, hours: int | None, days: int | None,
+                  date: str | None, dt_from: str | None, dt_to: str | None) -> None:
+    day_from, day_to, ts_from, ts_to = _messages_window(hours, days, date, dt_from, dt_to)
+    kinds = list(_MESSAGE_KIND_QUERIES) if kind == "all" else [kind] if kind != "service" else []
+    entries: list[tuple[str, str, str, str]] = []  # (sort_ts, kind, meta, text)
+
+    mod = _load_alert_bridge_module()
+    for k in kinds:
+        table, day_col, ts_col, renderer = _MESSAGE_KIND_QUERIES[k]
+        for r in _fetch_kind_rows(conn, table, day_col, ts_col, day_from, day_to, ts_from, ts_to):
+            sent = r["sent"] if "sent" in r.keys() else None
+            meta = f"{k.upper()} | sent={'так' if sent else 'ні' if sent is not None else '?'}"
+            entries.append((str(r[ts_col]), k, meta, renderer(mod, r)))
+
+    if kind in ("all", "service"):
+        for r in _fetch_service_rows(conn, day_from, day_to, ts_from, ts_to):
+            meta = f"SERVICE/{r['kind']} | ts={r['ts']} | delivered={'так' if r['delivered'] else 'ні'}"
+            entries.append((str(r["ts"]), "service", meta, r["text"]))
+
+    entries.sort(key=lambda e: e[0])
+
+    if not entries:
+        print("Жодного архівованого повідомлення не знайдено за цими фільтрами.")
+        return
+
+    for sort_ts, k, meta, text in entries:
+        print("=" * 78)
+        print(f"[{meta}]")
+        print("-" * 78)
+        print(text)
+    print("=" * 78)
+    print(f"\nВсього повідомлень: {len(entries)}")
+    _jlog(f"--messages kind={kind}: {len(entries)} message(s) shown")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze Suricata alert-bridge SQLite statistics.")
     parser.add_argument("--sum", "--total", action="store_true", help="Summary across every recorded day")
@@ -880,6 +1099,22 @@ def main():
     parser.add_argument("--fix", action="store_true",
                         help="With --verify-blocks: re-add every genuinely-missing entry "
                              "(IPs and subnets alike) back onto the live MikroTik list")
+    parser.add_argument("--messages", action="store_true",
+                        help="Show archived sent messages (slot digests, daily reports, spike "
+                             "alerts, service events) reconstructed in the exact text Telegram "
+                             "received; combine with --kind/--hours/--days/--date/--from/--to")
+    parser.add_argument("--kind", choices=["slot", "daily", "spike", "service", "all"], default="all",
+                        help="With --messages: restrict to one message kind (default: all)")
+    parser.add_argument("--hours", type=int, metavar="N",
+                        help="With --messages: only messages sent in the last N hours")
+    parser.add_argument("--days", type=int, metavar="N",
+                        help="With --messages: only messages covering the last N calendar days")
+    parser.add_argument("--date", metavar="YYYY-MM-DD",
+                        help="With --messages: only messages covering this calendar date")
+    parser.add_argument("--from", dest="dt_from", metavar="'YYYY-MM-DD[ HH:MM]'",
+                        help="With --messages: explicit range start (sent-at timestamp)")
+    parser.add_argument("--to", dest="dt_to", metavar="'YYYY-MM-DD[ HH:MM]'",
+                        help="With --messages: explicit range end (sent-at timestamp)")
     args = parser.parse_args()
     if args.list_out and not args.list:
         args.list = True
@@ -916,6 +1151,9 @@ def main():
             did_something = True
         if args.verify_blocks:
             cmd_verify_blocks(conn, fix=args.fix)
+            did_something = True
+        if args.messages:
+            cmd_messages(conn, args.kind, args.hours, args.days, args.date, args.dt_from, args.dt_to)
             did_something = True
         if args.sum or not did_something:
             cmd_sum(conn, show_list=args.list, out_fh=out_fh)

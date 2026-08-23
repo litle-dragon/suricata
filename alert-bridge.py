@@ -23,7 +23,9 @@ Persistence: SQLite at /var/log/suricata/alert_bridge.db (WAL mode) is the singl
 system of record. Tables: seen_ips / seen_subnets (all-time uniqueness), daily_stats
 (full historical daily archive), slot_digests (6h slot archive), spike_events (anomaly log),
 permanent_blocks (audit of everything ever permanently blocked), subnet_active_days (per-day
-attacker-IP presence per subnet, drives the multi-day override).
+attacker-IP presence per subnet, drives the multi-day override), service_events (literal
+text of lifecycle/reconcile/on-demand messages -- the only kinds with no structured table
+to reconstruct their text from later; see analyze_stats.py --messages).
 
 Notifications (per-alert Telegram is DISABLED):
   1. Anomaly / Spike Alert: fires only when the inbound alert rate over a sliding
@@ -33,11 +35,20 @@ Notifications (per-alert Telegram is DISABLED):
      right before the slot resets sends a follow-up summary of anything it had to block.
   3. 07:00 AM daily report: summary of the previous full day, read from daily_stats.
   4. Service lifecycle: a message on start and on graceful stop (SIGTERM/SIGINT).
+  5. On-demand snapshot, outside the normal schedule: `systemctl kill -s SIGUSR1
+     alert-bridge` sends the current, still-open 6h slot's data-so-far in the same
+     format as a real slot digest; `SIGUSR2` does the same for the current, still-open
+     day in the same format as the 07:00 report. Neither resets any counter or writes
+     to slot_digests/daily_stats -- both are archived to service_events instead.
 
 Delivery tracking: every archived report/digest/spike row has a `sent` flag, set only
 after a confirmed Telegram 200. On every process start (i.e. on every service status
 change — start, restart, crash recovery) resend_missed_reports() finds any unsent row
 from the last 3 days and resends it before following new alerts.
+
+Message search: analyze_stats.py --messages reconstructs and prints archived reports
+(slot/daily/spike from their structured columns, service_events verbatim), filterable
+by --kind/--hours/--days/--date/--from/--to.
 """
 
 import configparser
@@ -255,6 +266,22 @@ CREATE TABLE IF NOT EXISTS subnet_daily_ips (
     ip TEXT NOT NULL,
     PRIMARY KEY (subnet, day, ip)
 );
+-- Messages that have no other structured home: lifecycle start/stop banners,
+-- the slot-reconcile batch summary, and on-demand (SIGUSR1/SIGUSR2) report
+-- snapshots. Unlike slot_digests/daily_stats/spike_events (whose structured
+-- columns let us re-render the exact original text on demand), these are
+-- one-off notifications whose underlying counters keep changing after the
+-- fact -- so the literal text is archived directly, there is nothing to
+-- reconstruct it from later.
+CREATE TABLE IF NOT EXISTS service_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    kind TEXT NOT NULL,
+    text TEXT NOT NULL,
+    delivered INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_service_events_ts ON service_events(ts);
+CREATE INDEX IF NOT EXISTS idx_service_events_kind ON service_events(kind);
 """
 
 # Columns added after initial release — applied via ALTER TABLE on databases
@@ -360,8 +387,30 @@ def _handle_shutdown_signal(signum, frame) -> None:
     _shutdown_requested = True
 
 
+# On-demand report requests (SIGUSR1/SIGUSR2): a signal handler must be fast
+# and reentrancy-safe, so it only sets a flag here -- the actual send happens
+# on the next check_periodic_tasks() pass in the main loop, same pattern as
+# _shutdown_requested above. Trigger from the box: `systemctl kill -s SIGUSR1
+# alert-bridge` (current 6h slot, data-so-far) / `SIGUSR2` (current day,
+# data-so-far) -- see README "Ad-hoc / on-demand report" section.
+_ondemand_slot_requested = False
+_ondemand_daily_requested = False
+
+
+def _handle_ondemand_slot_signal(signum, frame) -> None:
+    global _ondemand_slot_requested
+    _ondemand_slot_requested = True
+
+
+def _handle_ondemand_daily_signal(signum, frame) -> None:
+    global _ondemand_daily_requested
+    _ondemand_daily_requested = True
+
+
 signal.signal(signal.SIGTERM, _handle_shutdown_signal)
 signal.signal(signal.SIGINT, _handle_shutdown_signal)
+signal.signal(signal.SIGUSR1, _handle_ondemand_slot_signal)
+signal.signal(signal.SIGUSR2, _handle_ondemand_daily_signal)
 
 
 def db_init() -> None:
@@ -601,6 +650,24 @@ def telegram_send(text: str) -> bool:
     except requests.RequestException as e:
         print(f"telegram failed: {e}", flush=True)
         return False
+
+
+def archive_send(text: str, kind: str) -> bool:
+    """telegram_send() plus a permanent record in service_events -- for the
+    handful of message kinds with no other structured storage to reconstruct
+    them from later (lifecycle start/stop, slot-reconcile summaries, and
+    on-demand SIGUSR1/SIGUSR2 snapshots). Archives regardless of delivery
+    outcome (delivered=0/1) so a failed send is still visible to --messages;
+    archival failure never blocks or reverses the actual notification."""
+    sent_ok = telegram_send(text)
+    try:
+        _conn.execute(
+            "INSERT INTO service_events(kind, text, delivered) VALUES(?,?,?)",
+            (kind, text, int(sent_ok)),
+        )
+    except sqlite3.Error as e:
+        print(f"service_events archive failed for kind={kind}: {e}", flush=True)
+    return sent_ok
 
 
 def mikrotik_lookup_covered(ip: str, block_list: str = BLOCK_LIST) -> str:
@@ -1021,6 +1088,79 @@ def send_7am_daily_report() -> None:
     print(f"7am-report sent for {day}: {sent_ok}", flush=True)
 
 
+def send_slot_digest_ondemand() -> None:
+    """SIGUSR1 dispatch: renders the current, still-open 6h slot through the
+    same builder/format as the real end-of-slot digest -- data as of right
+    now, not a completed period. Does not reset slot state or write a
+    slot_digests row (the slot hasn't actually ended); archived to
+    service_events instead since the underlying counters keep changing."""
+    total = _slot_alerts_count
+    unique_ips = len(_slot_inbound_counts)
+    unique_subnets = len(_slot_inbound_subnets)
+    new_ips = len(_slot_new_ips)
+    new_subnets = len(_slot_new_subnets)
+    avg_per_ip = round(total / unique_ips) if unique_ips else 0
+    avg_per_subnet = round(total / unique_subnets) if unique_subnets else 0
+    top, single_count, single_alerts = _top_and_singles(_slot_inbound_subnets)
+    start, end = _slot_bounds(_slot_index)
+    now_label = time.strftime("%H:%M")
+    new_ips_list = sorted(_slot_new_ips) if new_ips < NEW_ADDR_LIST_THRESHOLD else []
+    new_subnets_list = sorted(_slot_new_subnets) if new_subnets < NEW_ADDR_LIST_THRESHOLD else []
+    perm_ips_list = sorted(_slot_perm_ips_list) if _slot_perm_ips_count < NEW_ADDR_LIST_THRESHOLD else []
+    perm_subnets_list = sorted(_slot_perm_subnets_list) if _slot_perm_subnets_count < NEW_ADDR_LIST_THRESHOLD else []
+    geo_counts = {cc: _slot_geo_counts.get(cc, 0) for cc in geo_lists.COUNTRIES}
+    geo_new_counts = {cc: _slot_geo_new_counts.get(cc, 0) for cc in geo_lists.COUNTRIES}
+
+    header = (f"📊 6-годинний дайджест — ПОЗАЧЕРГОВО\n"
+              f"Період: {start} - {end} ({_digest_day}), дані станом на {now_label}")
+    lines = _build_periodic_report_lines(
+        header, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
+        _slot_perm_ips_count, _slot_perm_subnets_count, single_count, single_alerts,
+        top, "поточний слот", new_ips_list=new_ips_list, new_subnets_list=new_subnets_list,
+        perm_ips_list=perm_ips_list, perm_subnets_list=perm_subnets_list,
+        geo_counts=geo_counts, spamhaus_count=_slot_spamhaus_count,
+        geo_new_counts=geo_new_counts, spamhaus_new_count=_slot_spamhaus_new_count,
+    )
+    sent_ok = archive_send("\n".join(lines), "slot-ondemand")
+    print(f"ondemand-slot-digest sent={sent_ok}", flush=True)
+
+
+def send_daily_report_ondemand() -> None:
+    """SIGUSR2 dispatch: renders today's still-open day through the same
+    builder/format as the real 07:00 report for yesterday, but sourced from
+    today's live _daily_* counters -- data as of right now, day not yet
+    over. Does not touch daily state or daily_stats; archived to
+    service_events, same reasoning as send_slot_digest_ondemand()."""
+    total = sum(_daily_inbound_counts.values())
+    unique_ips = len(_daily_inbound_counts)
+    unique_subnets = len(_daily_inbound_subnets)
+    new_ips = len(_daily_new_ips)
+    new_subnets = len(_daily_new_subnets)
+    avg_per_ip = round(total / unique_ips) if unique_ips else 0
+    avg_per_subnet = round(total / unique_subnets) if unique_subnets else 0
+    top, single_count, single_alerts = _top_and_singles(_daily_inbound_subnets)
+    now_label = time.strftime("%H:%M")
+    new_ips_list = sorted(_daily_new_ips) if new_ips < NEW_ADDR_LIST_THRESHOLD else []
+    new_subnets_list = sorted(_daily_new_subnets) if new_subnets < NEW_ADDR_LIST_THRESHOLD else []
+    perm_ips_list = sorted(_daily_permanent_ips_list) if _daily_permanent_ips_count < NEW_ADDR_LIST_THRESHOLD else []
+    perm_subnets_list = sorted(_daily_permanent_subnets_list) if _daily_permanent_subnets_count < NEW_ADDR_LIST_THRESHOLD else []
+    geo_counts = {cc: _daily_geo_counts.get(cc, 0) for cc in geo_lists.COUNTRIES}
+    geo_new_counts = {cc: _daily_geo_new_counts.get(cc, 0) for cc in geo_lists.COUNTRIES}
+
+    header = (f"🌅 Звіт за поточну добу ({_digest_day}) — ПОЗАЧЕРГОВО, "
+              f"доба ще не завершена, дані станом на {now_label} 📊")
+    lines = _build_periodic_report_lines(
+        header, total, new_ips, new_subnets, avg_per_ip, avg_per_subnet,
+        _daily_permanent_ips_count, _daily_permanent_subnets_count, single_count, single_alerts,
+        top, "поточну добу", new_ips_list=new_ips_list, new_subnets_list=new_subnets_list,
+        perm_ips_list=perm_ips_list, perm_subnets_list=perm_subnets_list,
+        geo_counts=geo_counts, spamhaus_count=_daily_spamhaus_count,
+        geo_new_counts=geo_new_counts, spamhaus_new_count=_daily_spamhaus_new_count,
+    )
+    sent_ok = archive_send("\n".join(lines), "daily-ondemand")
+    print(f"ondemand-daily-report sent={sent_ok}", flush=True)
+
+
 def resend_missed_reports() -> None:
     """
     Startup delivery reconciliation (todo #1): runs once per process start —
@@ -1245,17 +1385,26 @@ def reconcile_slot_blocks() -> None:
         lines.append("ТОП10 заблокованих підмереж цього прогону:")
         for subnet_str, ips, alerts in top10:
             lines.append(f"• {subnet_str} — {ips:,} IP | {alerts:,} алертів")
-    telegram_send("\n".join(lines))
+    archive_send("\n".join(lines), "reconcile")
     print(f"slot-reconcile-summary blocked_ips={len(newly_blocked_ips)} "
           f"blocked_subnets={len(newly_blocked_subnets)}", flush=True)
 
 
 def check_periodic_tasks() -> None:
-    global _last_7am_report_date
+    global _last_7am_report_date, _ondemand_slot_requested, _ondemand_daily_requested
     now = time.time()
     today = time.strftime("%Y-%m-%d")
     current_hour = int(time.strftime("%H"))
     cur_slot = current_hour // 6
+
+    # 0. On-demand report requests (SIGUSR1/SIGUSR2), checked first so they
+    #    fire on the very next poll tick regardless of slot/day boundaries.
+    if _ondemand_slot_requested:
+        _ondemand_slot_requested = False
+        send_slot_digest_ondemand()
+    if _ondemand_daily_requested:
+        _ondemand_daily_requested = False
+        send_daily_report_ondemand()
 
     # Prune the sliding window even when idle (no new alerts arriving)
     cutoff = now - SLIDING_WINDOW
@@ -1319,7 +1468,7 @@ def main() -> None:
 
     # Service lifecycle notification (todo #3) — fires on every start, including
     # systemd auto-restarts after a crash, so a flapping service is visible in TG.
-    telegram_send(f"🟢 alert-bridge запущено (spike N={SPIKE_THRESHOLD_N})")
+    archive_send(f"🟢 alert-bridge запущено (spike N={SPIKE_THRESHOLD_N})", "lifecycle-start")
     print(f"following {EVE_LOG}, blocking via {MT_HOST}, spike N={SPIKE_THRESHOLD_N}", flush=True)
 
     # Delivery reconciliation (todo #1): resend anything archived-but-unconfirmed
@@ -1488,7 +1637,7 @@ def main() -> None:
     finally:
         # Graceful stop (todo #3): reached on SIGTERM/SIGINT (systemd stop/restart)
         # or an unhandled exception unwinding out of the loop.
-        telegram_send("🔴 alert-bridge зупиняється")
+        archive_send("🔴 alert-bridge зупиняється", "lifecycle-stop")
         print("alert-bridge stopping, closing db", flush=True)
         if _conn is not None:
             _conn.close()
