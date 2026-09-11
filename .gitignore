@@ -1,7 +1,7 @@
-/env
 __pycache__/*
 oldplan.md
 .env
 .env.*
+!.env.example
 .envrc
 *.env

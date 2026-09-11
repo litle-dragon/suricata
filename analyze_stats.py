@@ -92,7 +92,7 @@ def _jlog(msg: str, level: int = syslog.LOG_INFO) -> None:
 
 
 def load_env():
-    env_path = "/opt/alert-bridge/env"
+    env_path = "/opt/alert-bridge/.env"
     if os.path.exists(env_path):
         try:
             with open(env_path, "r") as f:
@@ -381,7 +381,7 @@ def cmd_verify_blocks(conn: sqlite3.Connection, fix: bool = False):
     mt_pass = os.environ.get("MT_PASS", "")
     block_list = os.environ.get("BLOCK_LIST", "suricata-block")
     if not mt_host or not mt_user or not mt_pass or "YOUR_" in mt_host or "YOUR_" in mt_pass:
-        print("\nError: MikroTik credentials incomplete in /opt/alert-bridge/env.", file=sys.stderr)
+        print("\nError: MikroTik credentials incomplete in /opt/alert-bridge/.env.", file=sys.stderr)
         return
 
     try:
@@ -569,7 +569,7 @@ def merge_adjacent_subnets():
     mt_pass = os.environ.get("MT_PASS", "")
     block_list = os.environ.get("BLOCK_LIST", "suricata-block")
     if not mt_host or not mt_user or not mt_pass or "YOUR_" in mt_host or "YOUR_" in mt_pass:
-        print("\nError: MikroTik credentials incomplete in /opt/alert-bridge/env.", file=sys.stderr)
+        print("\nError: MikroTik credentials incomplete in /opt/alert-bridge/.env.", file=sys.stderr)
         return
 
     base_url = f"https://{mt_host}/rest/ip/firewall/address-list"
@@ -737,11 +737,11 @@ def sync_subnets_to_mikrotik(conn: sqlite3.Connection, subnets_to_block: list[tu
     mt_pass = os.environ.get("MT_PASS", "")
     block_list = os.environ.get("BLOCK_LIST", "suricata-block")
     if not mt_host or not mt_user or not mt_pass or "YOUR_" in mt_host or "YOUR_" in mt_pass:
-        print("\nError: MikroTik credentials incomplete in /opt/alert-bridge/env:", file=sys.stderr)
+        print("\nError: MikroTik credentials incomplete in /opt/alert-bridge/.env:", file=sys.stderr)
         print(f"  MT_HOST = '{mt_host}'", file=sys.stderr)
         print(f"  MT_USER = '{mt_user}'", file=sys.stderr)
         print(f"  MT_PASS = {'(set)' if mt_pass and 'YOUR_' not in mt_pass else '(missing or unconfigured)'}", file=sys.stderr)
-        print("Please edit /opt/alert-bridge/env with your router LAN IP and suricata API user password.", file=sys.stderr)
+        print("Please edit /opt/alert-bridge/.env with your router LAN IP and suricata API user password.", file=sys.stderr)
         return
     if not subnets_to_block:
         print("\nNo subnets matched the threshold to sync to MikroTik.")

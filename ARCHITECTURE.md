@@ -136,11 +136,11 @@ pipeline ескалює поступово, є вікно часу до permanen
 - **Suricata-бокс** (`suricata-ids`, SSH-alias) — Debian/Ubuntu, Suricata +
   `tzsp2pcap`/`tcpreplay` (systemd units `tzsp0-iface`/`tzsp-receiver`) +
   `alert-bridge.service` (`/opt/alert-bridge/{alert-bridge.py,
-  analyze_stats.py,env,alert-bridge.cfg}`) + `cron.daily/update-geo-lists`.
+  analyze_stats.py,.env,alert-bridge.cfg}`) + `cron.daily/update-geo-lists`.
 - **MikroTik router** — `/tool sniffer` (TZSP mirror), REST API (`www-ssl`,
   Basic Auth, IP-обмежений на Suricata-бокс), RAW-правила
   (`suricata-block`/`suricata-geo-block`/`suricata-spamhaus-block`).
-- **Секрети** — `/opt/alert-bridge/env` (Telegram token, MikroTik
+- **Секрети** — `/opt/alert-bridge/.env` (Telegram token, MikroTik
   креденшели, WAN IP), права `600`, ніколи в git (`.gitignore`: `.env`,
   `.env.*`, `.envrc`, `*.env`).
 - **Деплой** — `git push` → на боксі `sudo curl -o ... raw.githubusercontent.com/...`

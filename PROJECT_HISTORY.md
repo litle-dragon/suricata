@@ -98,7 +98,7 @@ sid-діапазон `9000001-9000012` зарезервований під цю 
 
 ## 2. Скрипт `update_geo_lists.py`
 
-Стиль `argparse` + `syslog`-логування (`_jlog`), читає `env`/`alert-bridge.cfg`, atomic write (`tmp` + `os.replace`):
+Стиль `argparse` + `syslog`-логування (`_jlog`), читає `.env`/`alert-bridge.cfg`, atomic write (`tmp` + `os.replace`):
 1. Фетчить `iwik.org/ipcountry/geoip.txt`, фільтрує за суфіксом країни (з cfg), пише `geo_<cc-lower>.lst`.
 2. Фетчить `spamhaus.org/drop/drop.txt`, парсить `CIDR ; SBLxxxxx` → `spamhaus.lst`.
 3. На мережевій помилці — не чіпає наявний файл, Telegram-warning.

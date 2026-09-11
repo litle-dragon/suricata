@@ -4,7 +4,7 @@ After=suricata.service
 
 [Service]
 ExecStart=/usr/bin/python3 /opt/alert-bridge/alert-bridge.py
-EnvironmentFile=/opt/alert-bridge/env
+EnvironmentFile=/opt/alert-bridge/.env
 Restart=always
 RestartSec=5
 User=root

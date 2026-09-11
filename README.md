@@ -10,7 +10,7 @@ Detection System that:
 
 This README is the step-by-step companion to the video tutorial. The three
 files in this repo — [`alert-bridge.py`](alert-bridge.py),
-[`alert-bridge.service`](alert-bridge.service), [`env.example`](env.example) —
+[`alert-bridge.service`](alert-bridge.service), [`.env.example`](.env.example) —
 are the alert bridge you'll install in Step 8.
 
 ## How it works
@@ -326,7 +326,7 @@ sudo python3 /opt/alert-bridge/update_geo_lists.py   # first run — populates e
 ```
 
 ```bash
-echo -e '#!/bin/sh\nCFG_FILE=/opt/alert-bridge/alert-bridge.cfg ENV_FILE=/opt/alert-bridge/env python3 /opt/alert-bridge/update_geo_lists.py' | sudo tee /etc/cron.daily/update-geo-lists
+echo -e '#!/bin/sh\nCFG_FILE=/opt/alert-bridge/alert-bridge.cfg ENV_FILE=/opt/alert-bridge/.env python3 /opt/alert-bridge/update_geo_lists.py' | sudo tee /etc/cron.daily/update-geo-lists
 sudo chmod +x /etc/cron.daily/update-geo-lists
 ```
 
@@ -672,15 +672,15 @@ Install it from this repo:
 sudo mkdir /opt/alert-bridge/
 sudo curl -o /opt/alert-bridge/alert-bridge.py https://raw.githubusercontent.com/litle-dragon/suricata/main/alert-bridge.py
 sudo curl -o /opt/alert-bridge/analyze_stats.py https://raw.githubusercontent.com/litle-dragon/suricata/main/analyze_stats.py
-sudo curl -o /opt/alert-bridge/env https://raw.githubusercontent.com/litle-dragon/suricata/main/env.example
+sudo curl -o /opt/alert-bridge/.env https://raw.githubusercontent.com/litle-dragon/suricata/main/.env.example
 sudo curl -o /opt/alert-bridge/alert-bridge.cfg https://raw.githubusercontent.com/litle-dragon/suricata/main/alert-bridge.cfg.example
 sudo curl -o /etc/systemd/system/alert-bridge.service https://raw.githubusercontent.com/litle-dragon/suricata/main/alert-bridge.service
-sudo chmod 600 /opt/alert-bridge/env
+sudo chmod 600 /opt/alert-bridge/.env
 sudo systemctl daemon-reload
 ```
 
 Secrets and per-deployment values (Telegram token, MikroTik credentials, WAN
-IPs) live in `/opt/alert-bridge/env`. The template contains **no real
+IPs) live in `/opt/alert-bridge/.env`. The template contains **no real
 addresses** — every value is a placeholder (or empty) that you fill in
 during the steps below, so the bridge does nothing until it's configured
 for *your* network.
@@ -746,7 +746,7 @@ Enable the REST API (rides on `www-ssl`), restricted to the Suricata box:
 > over HTTPS from other machines, include your LAN subnet in that address
 > list **before** pressing Enter.
 
-Put the router's LAN IP, user, and password into `/opt/alert-bridge/env` —
+Put the router's LAN IP, user, and password into `/opt/alert-bridge/.env` —
 replace the `MT_HOST=YOUR_ROUTER_LAN_IP` placeholder with your router's
 address (`192.168.12.200` in the examples above) and fill in `MT_USER=` and
 `MT_PASS=`.
@@ -777,7 +777,7 @@ can never block your own LAN:
 
 ### 8d. Start the bridge
 
-Finish `/opt/alert-bridge/env` with your own public addresses so the bridge
+Finish `/opt/alert-bridge/.env` with your own public addresses so the bridge
 can never block *you*. These ship **empty** in the template — set them to
 your own values in CIDR notation (from the Prerequisites table), e.g.:
 
@@ -833,7 +833,7 @@ automatically on first run), and Telegram fires for only three things:
 | 📊 **6-hour digest** | Sent at each fixed clock slot — `00:00`, `06:00`, `12:00`, `18:00` — summarizing the slot that just ended. |
 | 🌅 **Daily report** | Sent once at 07:00 for the previous full day. |
 
-Tune the spike threshold in `/opt/alert-bridge/env`. To find a sensible `N`
+Tune the spike threshold in `/opt/alert-bridge/.env`. To find a sensible `N`
 for your network, watch your own background rate first:
 
 ```bash
@@ -997,7 +997,7 @@ sudo suricata -T -c /etc/suricata/suricata.yaml   # config still valid?
 ```
 
 - Is your **current** public IP still in `HOME_NET`? (If your ISP address
-  changed, update `suricata.yaml` and `/opt/alert-bridge/env`.)
+  changed, update `suricata.yaml` and `/opt/alert-bridge/.env`.)
 - Is `checksum-checks: no` set on the af-packet interface?
 
 **Blocks not landing on the router?** `journalctl -u alert-bridge -f` shows
@@ -1054,5 +1054,5 @@ sudo tail -f /var/log/suricata/eve.json | jq -c 'select(.event_type=="alert") | 
 | [`CONTEXT.md`](CONTEXT.md) | Domain glossary |
 | [`PROJECT_HISTORY.md`](PROJECT_HISTORY.md) | Historical specs/plan/ADRs — how decisions were made, not current state |
 | [`TODO.md`](TODO.md) | Prioritized improvement plan |
-| [`env.example`](env.example) | Secrets/deployment template (Telegram, MikroTik, WAN IPs) → copy to `/opt/alert-bridge/env` |
+| [`.env.example`](.env.example) | Secrets/deployment template (Telegram, MikroTik, WAN IPs) → copy to `/opt/alert-bridge/.env` |
 | [`alert-bridge.cfg.example`](alert-bridge.cfg.example) | Blocking/anomaly threshold template → copy to `/opt/alert-bridge/alert-bridge.cfg` |

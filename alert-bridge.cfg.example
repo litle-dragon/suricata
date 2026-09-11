@@ -4,7 +4,7 @@
 #   sudo systemctl restart alert-bridge
 #
 # Secrets (Telegram token, MikroTik credentials, WAN IPs) stay in
-# /opt/alert-bridge/env — this file only holds tunable thresholds and
+# /opt/alert-bridge/.env — this file only holds tunable thresholds and
 # timings. A missing file, missing section, or missing key falls back to
 # the hardcoded default noted in each comment below, so alert-bridge.py
 # runs fine even if this file is deleted or only partially filled in.

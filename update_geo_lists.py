@@ -55,7 +55,7 @@ from collections import defaultdict
 syslog.openlog(ident="update_geo_lists", logoption=syslog.LOG_PID, facility=syslog.LOG_DAEMON)
 
 CFG_FILE = os.environ.get("CFG_FILE", "/opt/alert-bridge/alert-bridge.cfg")
-ENV_FILE = os.environ.get("ENV_FILE", "/opt/alert-bridge/env")
+ENV_FILE = os.environ.get("ENV_FILE", "/opt/alert-bridge/.env")
 
 _cfg = configparser.ConfigParser()
 if os.path.exists(CFG_FILE):
