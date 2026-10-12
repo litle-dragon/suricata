@@ -916,6 +916,41 @@ sudo python3 /opt/alert-bridge/analyze_stats.py --messages --from "2026-08-20 08
 `service` covers what has no other structured home: startup/shutdown
 banners, slot-reconcile batch summaries, and on-demand snapshots.
 
+### 8g. Watchdog: catch a silently dead pipeline
+
+Every check above assumes the bridge is *running* and *sees traffic*.
+Neither is guaranteed: `/tool sniffer` can stop streaming without crashing
+anything on either side — no failed systemd unit, no error line, nothing —
+and the periodic digest will correctly report "0 alerts", which looks fine
+at a glance but means the IDS is blind. The only independent signal is a
+second process that checks *is traffic actually flowing*, not just *did
+alert-bridge see any*.
+
+[`healthcheck.py`](healthcheck.py) runs every 5 minutes, deliberately
+without importing `alert-bridge.py`, and checks: the four systemd units are
+`active`; the MikroTik REST API reports `/tool sniffer` `running=true`;
+the `tzsp0` interface packet counter is actually increasing (not just the
+router's self-reported status); `eve.json` has a recent line; the
+geo/Spamhaus `.lst` files aren't stale. It pages the same Telegram chat on
+OK→FAIL, reminds every 30 minutes while still down, and sends one
+"back to OK" message on recovery — see `ARCHITECTURE.md` §8 for the full
+design rationale.
+
+```bash
+sudo curl -o /opt/alert-bridge/healthcheck.py https://raw.githubusercontent.com/litle-dragon/suricata/main/healthcheck.py
+sudo curl -o /etc/systemd/system/suricata-healthcheck.service https://raw.githubusercontent.com/litle-dragon/suricata/main/suricata-healthcheck.service
+sudo curl -o /etc/systemd/system/suricata-healthcheck.timer https://raw.githubusercontent.com/litle-dragon/suricata/main/suricata-healthcheck.timer
+sudo chmod +x /opt/alert-bridge/healthcheck.py
+sudo systemctl daemon-reload
+sudo systemctl enable --now suricata-healthcheck.timer
+
+# Prove it actually pages: stop a unit, wait for the next tick, restart it
+sudo systemctl stop alert-bridge
+sudo systemctl start suricata-healthcheck.service   # fires immediately, no need to wait 5 min
+sudo systemctl start alert-bridge
+sudo systemctl start suricata-healthcheck.service   # sends the "back to OK" message
+```
+
 ## Step 9 — Prove the whole loop
 
 From an **external** host (a VPS, or a phone hotspot — a scan from inside the
@@ -949,6 +984,17 @@ systemctl status tzsp-receiver      # is the decode pipeline running?
 (it does not survive reboots without the scheduler from Step 6). If you used
 Step 6b instead, check the rule counters: `/ip firewall mangle print stats
 where action=sniff-tzsp`.
+
+**`/tool sniffer print` shows `running: yes`, but nothing arrives — and
+nothing crashed on either side.** Happened in production 2026-10-12: the
+MikroTik sniffer silently stopped sending for ~18.5h with `running: yes`
+the whole time, no failed unit, no log line anywhere. `systemctl status
+tzsp-receiver`/`/tool sniffer print` alone can't catch this — you have to
+check whether the packet *counter* is moving, not just the reported state:
+`watch -n1 cat /sys/class/net/tzsp0/statistics/tx_packets` next to a live
+`/tool sniffer print`. This is exactly what Step 8g's watchdog automates
+and pages Telegram for — install it so you don't have to notice this by
+hand.
 
 Work along the chain — each step rules out the one before it:
 
@@ -1044,6 +1090,8 @@ sudo tail -f /var/log/suricata/eve.json | jq -c 'select(.event_type=="alert") | 
 |---|---|
 | [`alert-bridge.py`](alert-bridge.py) | Tails `eve.json`, blocks attackers via the MikroTik REST API, records to SQLite, and pages Telegram on spikes/digests; `SIGUSR1`/`SIGUSR2` send an on-demand slot/daily snapshot |
 | [`alert-bridge.service`](alert-bridge.service) | systemd unit for the bridge |
+| [`healthcheck.py`](healthcheck.py) | Independent watchdog (doesn't import `alert-bridge.py`): checks the four systemd units, MikroTik `/tool sniffer` state, `tzsp0` packet counter, `eve.json` freshness, and geo/Spamhaus list freshness; pages Telegram on OK→FAIL / reminds every 30 min / FAIL→OK |
+| [`suricata-healthcheck.service`](suricata-healthcheck.service) / [`.timer`](suricata-healthcheck.timer) | systemd units: run `healthcheck.py` every 5 min |
 | [`analyze_stats.py`](analyze_stats.py) | Queries the SQLite database — daily summaries, spike log, top attackers, real addresses, subnet cleanup, sent-message search (`--sum` / `--day` / `--spikes` / `--top` / `--list` / `--list-out` / `--sync-mikrotik` / `--merge-adjacent` / `--verify-blocks` / `--fix` / `--messages`) |
 | [`geo_lists.py`](geo_lists.py) | Local "covering range" lookup over the same `.lst` files `update_geo_lists.py` writes — Suricata IP Reputation only reports category+score, not which CIDR matched |
 | [`update_geo_lists.py`](update_geo_lists.py) | Daily cron: fetches iwik.org/Spamhaus DROP, writes IP Reputation source files, triggers a live Suricata reload |

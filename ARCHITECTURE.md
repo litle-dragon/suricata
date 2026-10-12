@@ -136,7 +136,8 @@ pipeline ескалює поступово, є вікно часу до permanen
 - **Suricata-бокс** (`suricata-ids`, SSH-alias) — Debian/Ubuntu, Suricata +
   `tzsp2pcap`/`tcpreplay` (systemd units `tzsp0-iface`/`tzsp-receiver`) +
   `alert-bridge.service` (`/opt/alert-bridge/{alert-bridge.py,
-  analyze_stats.py,.env,alert-bridge.cfg}`) + `cron.daily/update-geo-lists`.
+  analyze_stats.py,healthcheck.py,.env,alert-bridge.cfg}`) +
+  `suricata-healthcheck.timer` (кожні 5 хв, §8) + `cron.daily/update-geo-lists`.
 - **MikroTik router** — `/tool sniffer` (TZSP mirror), REST API (`www-ssl`,
   Basic Auth, IP-обмежений на Suricata-бокс), RAW-правила
   (`suricata-block`/`suricata-geo-block`/`suricata-spamhaus-block`).
@@ -146,3 +147,31 @@ pipeline ескалює поступово, є вікно часу до permanen
 - **Деплой** — `git push` → на боксі `sudo curl -o ... raw.githubusercontent.com/...`
   (або напряму `sudo tee` по SSH, коли CDN кешує старе) → `py_compile` →
   `systemctl restart alert-bridge`.
+
+## 8. Health monitoring (`healthcheck.py`)
+
+**Чому.** Інцидент 2026-10-12: MikroTik `/tool sniffer` мовчки перестав
+стрімити TZSP (00:34–19:03, ~18.5 год) — жоден systemd-юніт по обидва боки
+не впав, жодного рядка в журналі. 6-годинні Telegram-дайджести коректно
+показали "0 алертів" (бо справді нуль пакетів долетіло до Suricata), але
+ніхто/ніщо не позначило це як аномалію — `alert-bridge.py` звітує про те,
+що бачив, а не про те, що мав побачити. Відновилось само собою після
+перезавантаження роутера о 19:03 (`/tool sniffer` не переживає ребут,
+README Step 6, scheduler `start-sniffer` запустив його знову при старті).
+
+**Що перевіряє** (`suricata-healthcheck.timer`, кожні 5 хв, незалежно від
+`alert-bridge.py` — щоб баг у самому бриджі не вимкнув і вартового):
+1. systemd: `suricata`/`tzsp-receiver`/`tzsp0-iface`/`alert-bridge` — усі `active`.
+2. MikroTik REST `/tool/sniffer` → `running=true`.
+3. Лічильник пакетів інтерфейсу `tzsp0` (`/sys/class/net/tzsp0/statistics/tx_packets`)
+   справді зростає — ловить саме сценарій 2026-10-12 (`running=true`, але
+   стрім насправді мертвий). Потрібні 2 поспіль нульові проби (~10 хв
+   тиші), лічильник після ребуту (менше за попередній) не рахується збоєм.
+4. `eve.json` — mtime не старіший 10 хв (будь-яка подія, не лише алерти).
+5. geo/spamhaus `.lst`-файли (`update_geo_lists.py`, cron.daily) — не
+   старіші 48 год.
+
+**Повідомлення.** Debounce через `/opt/alert-bridge/healthcheck_state.json`:
+миттєво на переході OK→FAIL, нагадування що 30 хв, доки все ще FAIL, одне
+"✅ … back to OK" на переході FAIL→OK. Той самий `TG_TOKEN`/`TG_CHAT`/
+`TG_THREAD_ID` з `.env`, той самий чат, що й основні дайджести.

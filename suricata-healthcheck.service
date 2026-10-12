@@ -1,0 +1,8 @@
+[Unit]
+Description=Suricata/MikroTik pipeline health check (one-shot, run by suricata-healthcheck.timer)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/alert-bridge/healthcheck.py
+EnvironmentFile=/opt/alert-bridge/.env
+User=root
