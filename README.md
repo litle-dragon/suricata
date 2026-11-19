@@ -445,8 +445,27 @@ the WAN interface(s) to come up and then (re)starts it.
 
 **Dual WAN Scheduler** (starts for both if both are ready, or only for the active WAN if only one is ready):
 ```routeros
-/system scheduler add name=start-sniffer on-event=":local i 0; :local w1 false; :local w2 false; :while (\$i < 180 and (\$w1 = false and \$w2 = false)) do={ :do { :set w1 [/interface get [find name=\"WAN1\"] running] } on-error={}; :do { :set w2 [/interface get [find name=\"WAN2\"] running] } on-error={}; :if (\$w1 = false and \$w2 = false) do={ :delay 1s; :set i (\$i + 1) } }; :delay 3s; :do { :set w1 [/interface get [find name=\"WAN1\"] running] } on-error={}; :do { :set w2 [/interface get [find name=\"WAN2\"] running] } on-error={}; :local ifaces \"\"; :if (\$w1 and \$w2) do={ :set ifaces \"WAN1,WAN2\" } else={ :if (\$w1) do={ :set ifaces \"WAN1\" }; :if (\$w2) do={ :set ifaces \"WAN2\" } }; :if (\$ifaces != \"\") do={ /tool sniffer stop; :delay 1s; /tool sniffer set filter-interface=\$ifaces; /tool sniffer start }" policy=ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon start-time=startup
+/system scheduler add name=start-sniffer interval=5m on-event=":local i 0; :local w1 false; :local w2 false; :while (\$i < 180 and (\$w1 = false and \$w2 = false)) do={ :do { :set w1 [/interface get [find name=\"WAN1\"] running] } on-error={}; :do { :set w2 [/interface get [find name=\"WAN2\"] running] } on-error={}; :if (\$w1 = false and \$w2 = false) do={ :delay 1s; :set i (\$i + 1) } }; :delay 3s; :do { :set w1 [/interface get [find name=\"WAN1\"] running] } on-error={}; :do { :set w2 [/interface get [find name=\"WAN2\"] running] } on-error={}; :local ifaces \"\"; :if (\$w1 and \$w2) do={ :set ifaces \"WAN1,WAN2\" } else={ :if (\$w1) do={ :set ifaces \"WAN1\" }; :if (\$w2) do={ :set ifaces \"WAN2\" } }; :if (\$ifaces != \"\") do={ :do { /tool sniffer set filter-interface=\$ifaces } on-error={}; :if ([/tool sniffer get running] = false) do={ /tool sniffer start } }" policy=ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon start-time=startup
 ```
+
+> ⚠️ **The REST API cannot control the sniffer — put its lifecycle in a
+> router-side scheduler only.** Measured on RouterOS 7.25.1 with a user whose
+> group held `sniff,sensitive,test,password,winbox,reboot,policy,write,api,rest-api`:
+> `POST /tool/sniffer/start` (and `stop`, `quick`, `save`) still returns
+> `not enough permissions (9)`, while `POST /tool/sniffer/set` and
+> `/tool/torch` succeed from the same session. `/tool sniffer` commands need a
+> real router session, so a Linux-side script can never (re)start the sniffer.
+> The same holds for a scheduler owned by the API user: RouterOS caps a
+> scheduler's policy to its owner's, so it silently fails too.
+>
+> Two rules follow from that:
+> 1. The scheduler must be created **by an admin** (full policy), and its
+>    `on-event` must verify `[/tool sniffer get running] = false` and call
+>    `start` — **not** merely compare `filter-interface`. A guard that only
+>    reacts to filter changes leaves the sniffer down after every reboot,
+>    because the saved filter list already matches what the script wants.
+> 2. Add `interval=5m` to the scheduler so a sniffer that dies unnoticed comes
+>    back on its own; `start-time=startup` alone only covers reboots.
 
 Back on the Linux box, packets should now be flowing:
 
