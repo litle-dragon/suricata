@@ -29,8 +29,11 @@
   1→2), знімач піднявся сам, `tzsp0` TX +5 157 пакетів/15 с; о 21:44:26
   healthcheck коректно сигналізував FAILED, о 21:49:53 — `health check OK`.
   Залишилось: (а) контрольний ребут (перевірити, що підйом іде без
-  ручних дій), (б) прибрати з групи `suricata-api` зайві `password`,
-  `winbox`, `reboot` — вони більше не потрібні, бо знімачем керує роутер.
+  ручних дій). **Права групи звужено 2026-11-19 21:53:** `suricata-api` =
+  `read,write,policy,api,rest-api` (решта позначена `!`, включно з
+  `!sniff,!sensitive`); після цього `PUT /ip/firewall/address-list` → 201,
+  `DELETE` → 204, healthcheck о 21:54:53 — OK, `alert-bridge` за 6 хв
+  зробив 25 блокувань (єдиний 400 — безпечний `already have such entry`).
 
 - [ ] **Розширити `test_geo_spamhaus_smoke.py`** кейсами `restore_period_state()`
   (byte-diff симуляція рестарту: заповнити стан → обнулити in-memory
