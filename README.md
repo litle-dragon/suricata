@@ -466,6 +466,12 @@ the WAN interface(s) to come up and then (re)starts it.
 >    because the saved filter list already matches what the script wants.
 > 2. Add `interval=5m` to the scheduler so a sniffer that dies unnoticed comes
 >    back on its own; `start-time=startup` alone only covers reboots.
+>    Measured on the 2026-11-19 reboot: `start-time=startup` did **not** fire
+>    (run-count stayed 0 for the whole first 5 min of uptime) — only the
+>    interval tick at 22:02:01 brought the sniffer up, i.e. ~5 min of blind
+>    IDS. Treat `interval` as the real recovery mechanism and keep it short
+>    (`interval=1m`); check `run-count`/`last-started` after a reboot instead
+>    of trusting the `startup` trigger.
 
 Back on the Linux box, packets should now be flowing:
 

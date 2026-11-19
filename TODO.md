@@ -34,6 +34,14 @@
   `!sniff,!sensitive`); після цього `PUT /ip/firewall/address-list` → 201,
   `DELETE` → 204, healthcheck о 21:54:53 — OK, `alert-bridge` за 6 хв
   зробив 25 блокувань (єдиний 400 — безпечний `already have such entry`).
+  **Контрольний ребут роутера 2026-11-19 21:56:44:** знімач піднявся сам,
+  але **не** через `start-time=startup` — той не спрацював (run-count=0 усі
+  перші 5 хв uptime). Підйом стався на тіку `interval=5m` о 22:02:01 →
+  сліпа зона ~5 хв 17 с. `tzsp0` TX одразу +17 093 пакети/15 с,
+  healthcheck: FAILED о 22:00:13 (детекція працює), OK о 22:05:38.
+  Наступний крок: зменшити `interval` до `1m` (адмін:
+  `/system scheduler set [find name=sniffer-watchdog] interval=1m`) — це
+  єдиний реальний механізм відновлення, тож сліпа зона має бути ≤1 хв.
 
 - [ ] **Розширити `test_geo_spamhaus_smoke.py`** кейсами `restore_period_state()`
   (byte-diff симуляція рестарту: заповнити стан → обнулити in-memory
